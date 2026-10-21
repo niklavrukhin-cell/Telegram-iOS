@@ -80,6 +80,9 @@ public final class ChatPanelInterfaceInteraction {
     public let blockMessageAuthor: (EngineRawMessage, ContextControllerProtocol?) -> Void
     public let deleteMessages: ([EngineRawMessage], ContextControllerProtocol?, @escaping (ContextMenuActionResult) -> Void) -> Void
     public let forwardSelectedMessages: () -> Void
+    public let replyToSelectedMessages: () -> Void
+    // Drops one message from the reply deck; the last one removed clears the reply
+    public let removeReplyDeckMessage: (EngineMessage.Id) -> Void
     public let forwardCurrentForwardMessages: () -> Void
     public let forwardMessages: ([EngineRawMessage]) -> Void
     public let updateForwardOptionsState: ((ChatInterfaceForwardOptionsState) -> ChatInterfaceForwardOptionsState) -> Void
@@ -335,9 +338,13 @@ public final class ChatPanelInterfaceInteraction {
         updateDisplayHistoryFilterAsList: @escaping (Bool) -> Void,
         requestLayout: @escaping (ContainedViewLayoutTransition) -> Void,
         chatController: @escaping () -> ViewController?,
-        statuses: ChatPanelInterfaceInteractionStatuses?
+        statuses: ChatPanelInterfaceInteractionStatuses?,
+        replyToSelectedMessages: @escaping () -> Void = {},
+        removeReplyDeckMessage: @escaping (EngineMessage.Id) -> Void = { _ in }
     ) {
         self.setupReplyMessage = setupReplyMessage
+        self.replyToSelectedMessages = replyToSelectedMessages
+        self.removeReplyDeckMessage = removeReplyDeckMessage
         self.setupEditMessage = setupEditMessage
         self.beginMessageSelection = beginMessageSelection
         self.cancelMessageSelection = cancelMessageSelection

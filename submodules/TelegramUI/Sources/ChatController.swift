@@ -9114,6 +9114,68 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
         return .single(false)
     }
     
+    // Reply decks of the messages being sent, by the index of the message
+    func takeMultiReplyTargets(_ messages: [EnqueueMessage]) -> [Int: [EngineMessage.Id]] {
+        var targets: [Int: [EngineMessage.Id]] = [:]
+        for (index, message) in messages.enumerated() {
+            if case let .message(_, _, _, _, _, replyToMessageId?, _, _, _, _) = message, let deckMessageIds = MultiReplyStore.shared.takePendingDeck(firstMessageId: replyToMessageId.messageId) {
+                targets[index] = deckMessageIds
+            }
+        }
+        return targets
+    }
+    
+    func registerMultiReplies(_ targets: [Int: [EngineMessage.Id]], messageIds: [EngineMessage.Id?]) {
+        let postbox = self.context.account.postbox
+        for (index, deckMessageIds) in targets {
+            guard index < messageIds.count, let messageId = messageIds[index] else {
+                continue
+            }
+            let _ = (postbox.transaction { transaction -> UInt32? in
+                return transaction.getMessage(messageId)?.stableId
+            }
+            |> deliverOnMainQueue).startStandalone(next: { [weak self] stableId in
+                guard let stableId else {
+                    return
+                }
+                MultiReplyStore.shared.register(stableId: stableId, messageIds: deckMessageIds)
+                self?.chatDisplayNode.historyNode.requestMessageUpdate(stableId: stableId)
+            })
+        }
+    }
+    
+    // A single message is an ordinary reply, several form a reply deck
+    func updateReplyDeck(_ messageIds: [EngineMessage.Id], innerSubject: EngineMessageReplyInnerSubject? = nil) {
+        guard let firstMessageId = messageIds.first else {
+            return
+        }
+        let historyNode = self.chatDisplayNode.historyNode
+        let messages = messageIds.compactMap { id -> EngineRawMessage? in
+            return historyNode.messageInCurrentHistoryView(id)?._asMessage() ?? MultiReplyStore.shared.cachedMessage(id: id)
+        }
+        let extraMessageIds = Array(messageIds.dropFirst())
+        if extraMessageIds.isEmpty {
+            MultiReplyStore.shared.clearPendingDeck(peerId: firstMessageId.peerId)
+        } else {
+            MultiReplyStore.shared.setPendingDeck(messageIds: messageIds, messages: messages)
+        }
+        let firstMessage = messages.first(where: { $0.id == firstMessageId })
+        self.updateChatPresentationInterfaceState(animated: true, interactive: true, { state in
+            var state = state.updatedInterfaceState {
+                $0.withUpdatedReplyMessageSubject(ChatInterfaceState.ReplyMessageSubject(
+                    messageId: firstMessageId,
+                    quote: nil,
+                    innerSubject: innerSubject,
+                    extraMessageIds: extraMessageIds.isEmpty ? nil : extraMessageIds
+                )).withoutSelectionState()
+            }
+            if let firstMessage {
+                state = state.updatedReplyMessage(firstMessage)
+            }
+            return state.updatedSearch(nil).updatedShowCommands(false)
+        })
+    }
+    
     func sendMessages(_ messages: [EnqueueMessage], media: Bool = false, postpone: Bool = false, commit: Bool = false) {
         if case let .customChatContents(customChatContents) = self.subject {
             customChatContents.enqueueMessages(messages: messages)
@@ -9153,8 +9215,11 @@ public final class ChatControllerImpl: TelegramBaseController, ChatController, G
             if commit || !isScheduledMessages {
                 self.commitPurposefulAction()
                 
-                let _ = (enqueueMessages(account: self.context.account, peerId: peerId, messages: self.transformEnqueueMessages(messages, postpone: postpone))
-                |> deliverOnMainQueue).startStandalone(next: { [weak self] _ in
+                let transformedMessages = self.transformEnqueueMessages(messages, postpone: postpone)
+                let multiReplyTargets = self.takeMultiReplyTargets(transformedMessages)
+                let _ = (enqueueMessages(account: self.context.account, peerId: peerId, messages: transformedMessages)
+                |> deliverOnMainQueue).startStandalone(next: { [weak self] messageIds in
+                    self?.registerMultiReplies(multiReplyTargets, messageIds: messageIds)
                     if let strongSelf = self, strongSelf.presentationInterfaceState.subject != .scheduledMessages {
                         strongSelf.chatDisplayNode.historyNode.scrollToEndOfHistory()
                     }

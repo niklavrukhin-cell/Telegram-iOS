@@ -481,11 +481,14 @@ public final class ChatInterfaceState: Codable, Equatable {
         public var messageId: EngineMessage.Id
         public var quote: EngineMessageReplyQuote?
         public var innerSubject: EngineMessageReplyInnerSubject?
+        // Messages answered together with `messageId`, oldest first
+        public var extraMessageIds: [EngineMessage.Id]?
         
-        public init(messageId: EngineMessage.Id, quote: EngineMessageReplyQuote?, innerSubject: EngineMessageReplyInnerSubject?) {
+        public init(messageId: EngineMessage.Id, quote: EngineMessageReplyQuote?, innerSubject: EngineMessageReplyInnerSubject?, extraMessageIds: [EngineMessage.Id]? = nil) {
             self.messageId = messageId
             self.quote = quote
             self.innerSubject = innerSubject
+            self.extraMessageIds = extraMessageIds
         }
         
         public var subjectModel: EngineMessageReplySubject {
@@ -592,11 +595,14 @@ public final class ChatInterfaceState: Codable, Equatable {
             // `state?.entities ?? []`, no `textSelection`).
             inputState = ChatTextInputState(inputText: chatInputStateStringWithAppliedEntities("", entities: []))
         }
+        // The synchronized draft carries a single reply target, so local extra targets of the same reply are kept
+        let currentReplyMessageSubject = self.replyMessageSubject
         var result = self.withUpdatedComposeInputState(inputState).withUpdatedReplyMessageSubject((state?.replySubject).flatMap {
             return ReplyMessageSubject(
                 messageId: $0.messageId,
                 quote: $0.quote,
-                innerSubject: $0.innerSubject
+                innerSubject: $0.innerSubject,
+                extraMessageIds: currentReplyMessageSubject?.messageId == $0.messageId ? currentReplyMessageSubject?.extraMessageIds : nil
             )
         })
         if let timestamp = state?.timestamp {

@@ -149,6 +149,16 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
     
     private var currentProgressDisposable: Disposable?
     
+    private var deckCounterLabel: UILabel?
+    private var deckStackView: UIImageView?
+    private var deckStackImageKey: DeckStackImageKey?
+    public private(set) var deckCounterFrame: CGRect?
+    private var appliedDeckActiveIndex: Int?
+    private var appliedDeckIsExpanded: Bool?
+    private var appliedDeckParentStableId: UInt32?
+    private var deckRowItems: [DeckRowItem] = []
+    public private(set) var deckCardTargets: [(messageId: EngineMessage.Id, frame: CGRect)] = []
+    
     public var isQuoteExpanded: Bool = false
     
     override public init() {
@@ -190,8 +200,45 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
         let previousMediaReference = maybeNode?.previousMediaReference
         
         let isQuoteExpanded = maybeNode?.isQuoteExpanded ?? false
+        let previousDeckRowTextNodes: [(title: TextNode?, text: TextNode?)] = maybeNode?.deckRowItems.map { ($0.titleNode, $0.textNode) } ?? []
         
-        return { arguments in
+        return { originalArguments in
+            var arguments = originalArguments
+            var deck = MultiReplyStore.shared.deck(parentStableId: originalArguments.parentMessage.stableId)
+            // A reply being sent is drawn as a deck from its first layout, so its size does not jump
+            if deck == nil, originalArguments.parentMessage.id.namespace == Namespaces.Message.Local, let firstMessageId = originalArguments.message?.id, let deckMessageIds = MultiReplyStore.shared.inFlightDeck(firstMessageId: firstMessageId) {
+                deck = MultiReplyStore.Deck(messageIds: deckMessageIds, activeIndex: 0, isExpanded: false)
+            }
+            if let deck {
+                if !deck.isExpanded, deck.activeIndex != 0, let activeMessage = MultiReplyStore.shared.cachedMessage(id: deck.activeMessageId) {
+                    arguments = Arguments(
+                        presentationData: originalArguments.presentationData,
+                        strings: originalArguments.strings,
+                        context: originalArguments.context,
+                        type: originalArguments.type,
+                        message: activeMessage,
+                        replyForward: nil,
+                        quote: nil,
+                        innerSubject: nil,
+                        story: nil,
+                        isSummarized: originalArguments.isSummarized,
+                        parentMessage: originalArguments.parentMessage,
+                        constrainedSize: originalArguments.constrainedSize,
+                        animationCache: originalArguments.animationCache,
+                        animationRenderer: originalArguments.animationRenderer,
+                        associatedData: originalArguments.associatedData
+                    )
+                }
+            }
+            let deckCounterText = deck.flatMap { $0.isExpanded ? "\($0.messageIds.count)" : "\($0.activeIndex + 1)/\($0.messageIds.count)" }
+            let deckCounterFont = Font.with(size: 11.0, weight: .semibold, traits: .monospacedNumbers)
+            let deckChevronWidth: CGFloat = 10.0
+            let deckCounterSize: CGSize = deckCounterText.flatMap { text in
+                let textSize = (text as NSString).size(withAttributes: [.font: deckCounterFont])
+                return CGSize(width: ceil(textSize.width) + 10.0 + (deck?.isExpanded == true ? deckChevronWidth : 0.0), height: 16.0)
+            } ?? CGSize()
+            let deckEdgeSpace: CGFloat = (deck == nil || deck!.isExpanded) ? 0.0 : CGFloat(min(deck!.messageIds.count - 1, 2)) * deckCardShift
+            
             let fontSize = floor(arguments.presentationData.fontSize.baseDisplaySize * 14.0 / 17.0)
             let titleFont = Font.semibold(fontSize)
             let textFont = Font.regular(fontSize)
@@ -740,6 +787,84 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
             if isExpiredStory || isStory || isPoll {
                 size.width += 16.0
             }
+            if deck != nil {
+                size.width += deckCounterSize.width + 4.0
+            }
+            size.width += deckEdgeSpace
+            let mainCardHeight = size.height
+            size.height += deckEdgeSpace
+            
+            let deckRowSpacing: CGFloat = 4.0
+            let deckRowLeftInset: CGFloat = 11.0
+            var deckRows: [(messageId: EngineMessage.Id, color: UIColor, secondaryColor: UIColor?, tertiaryColor: UIColor?, height: CGFloat, thumbnailMediaId: EngineMedia.Id?, titleLayout: TextNodeLayout, titleApply: () -> TextNode, textLayout: TextNodeLayout, textApply: () -> TextNode)] = []
+            var deckThumbnails: [DeckCardThumbnail] = []
+            let deckThumbnailBoundingSize = CGSize(width: imageSide, height: imageSide)
+            // Every card is measured, so the block keeps its width while cards are switched
+            if let deck {
+                for (deckIndex, messageId) in deck.messageIds.enumerated() {
+                    guard let rowMessage = (deckIndex == 0 ? originalArguments.message : nil) ?? MultiReplyStore.shared.cachedMessage(id: messageId) else {
+                        continue
+                    }
+                    let isDisplayedRow = deck.isExpanded && deckIndex != 0
+                    var rowColor: UIColor
+                    var rowSecondaryColor: UIColor?
+                    var rowTertiaryColor: UIColor?
+                    var rowAuthorColors: (main: UIColor, secondary: UIColor?, tertiary: UIColor?)?
+                    switch rowMessage.effectiveAuthor?.nameColor {
+                    case let .preset(nameColor):
+                        let colors = arguments.context.peerNameColors.get(nameColor, dark: arguments.presentationData.theme.theme.overallDarkAppearance)
+                        rowAuthorColors = (colors.main, colors.secondary, colors.tertiary)
+                    case let .collectible(collectibleColor):
+                        let colors = collectibleColor.peerNameColors(dark: arguments.presentationData.theme.theme.overallDarkAppearance)
+                        rowAuthorColors = (colors.main, colors.secondary, colors.tertiary)
+                    default:
+                        break
+                    }
+                    switch arguments.type {
+                    case let .bubble(incoming):
+                        if incoming, let rowAuthorColors {
+                            rowColor = rowAuthorColors.main
+                            rowSecondaryColor = rowAuthorColors.secondary
+                            rowTertiaryColor = rowAuthorColors.tertiary
+                        } else {
+                            rowColor = incoming ? arguments.presentationData.theme.theme.chat.message.incoming.accentTextColor : arguments.presentationData.theme.theme.chat.message.outgoing.accentTextColor
+                        }
+                    case .standalone:
+                        rowColor = mainColor
+                    }
+                    
+                    let authorTitle = rowMessage.effectiveAuthor.flatMap { EnginePeer($0).displayTitle(strings: arguments.strings, displayOrder: arguments.presentationData.nameDisplayOrder) } ?? ""
+                    let (rowTextString, rowIsMedia, _) = descriptionStringForMessage(contentSettings: arguments.context.currentContentSettings.with { $0 }, message: EngineMessage(rowMessage), strings: arguments.strings, nameDisplayOrder: arguments.presentationData.nameDisplayOrder, dateTimeFormat: arguments.presentationData.dateTimeFormat, accountPeerId: arguments.context.account.peerId)
+                    
+                    let rowTextColor: UIColor
+                    switch arguments.type {
+                    case let .bubble(incoming):
+                        let messageTheme = incoming ? arguments.presentationData.theme.theme.chat.message.incoming : arguments.presentationData.theme.theme.chat.message.outgoing
+                        rowTextColor = rowIsMedia ? messageTheme.secondaryTextColor : messageTheme.primaryTextColor
+                    case .standalone:
+                        rowTextColor = titleColor
+                    }
+                    
+                    let rowThumbnail = deckCardThumbnail(context: arguments.context, message: rowMessage)
+                    if let rowThumbnail {
+                        deckThumbnails.append(rowThumbnail)
+                    }
+                    let rowThumbnailInset: CGFloat = rowThumbnail != nil ? imageSide + 6.0 : 0.0
+                    
+                    let rowConstrainedSize = CGSize(width: max(0.0, arguments.constrainedSize.width - 8.0 - rowThumbnailInset), height: arguments.constrainedSize.height)
+                    let previousTextNodes: (title: TextNode?, text: TextNode?) = isDisplayedRow && deckRows.count < previousDeckRowTextNodes.count ? previousDeckRowTextNodes[deckRows.count] : (nil, nil)
+                    let (rowTitleLayout, rowTitleApply) = TextNode.asyncLayout(previousTextNodes.title)(TextNodeLayoutArguments(attributedString: NSAttributedString(string: authorTitle, font: titleFont, textColor: rowColor), backgroundColor: nil, maximumNumberOfLines: 1, truncationType: .end, constrainedSize: rowConstrainedSize, alignment: .natural, cutout: nil, insets: textInsets))
+                    let (rowTextLayout, rowTextApply) = TextNode.asyncLayout(previousTextNodes.text)(TextNodeLayoutArguments(attributedString: NSAttributedString(string: rowTextString.string, font: textFont, textColor: rowTextColor), backgroundColor: nil, maximumNumberOfLines: 1, truncationType: .end, constrainedSize: rowConstrainedSize, alignment: .natural, cutout: nil, insets: textInsets))
+                    
+                    let rowHeight = rowTitleLayout.size.height + rowTextLayout.size.height - 2 * (textInsets.top + textInsets.bottom) + 2 * spacing + 2.0
+                    let rowWidth = max(rowTitleLayout.size.width, rowTextLayout.size.width) - textInsets.left - textInsets.right + deckRowLeftInset + rowThumbnailInset + 6.0
+                    size.width = max(size.width, rowWidth + deckCounterSize.width + 4.0)
+                    if isDisplayedRow {
+                        size.height += deckRowSpacing + rowHeight
+                        deckRows.append((messageId, rowColor, rowSecondaryColor, rowTertiaryColor, rowHeight, rowThumbnail?.mediaId, rowTitleLayout, rowTitleApply, rowTextLayout, rowTextApply))
+                    }
+                }
+            }
             
             return (size, { realSize, attemptSynchronous, animation in
                 let node: ChatMessageReplyInfoNode
@@ -755,6 +880,16 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
                 }
                 
                 node.previousMediaReference = updatedMediaReference
+                
+                var deckSnapshotView: UIView?
+                let isSameDeck = deck != nil && node.appliedDeckParentStableId == arguments.parentMessage.stableId
+                node.appliedDeckParentStableId = deck != nil ? arguments.parentMessage.stableId : nil
+                let isExpanding = isSameDeck && deck?.isExpanded == true && node.appliedDeckIsExpanded == false
+                node.appliedDeckIsExpanded = deck?.isExpanded
+                if isSameDeck, let deck, !deck.isExpanded, let appliedDeckActiveIndex = node.appliedDeckActiveIndex, appliedDeckActiveIndex != deck.activeIndex {
+                    deckSnapshotView = node.view.snapshotView(afterScreenUpdates: false)
+                }
+                node.appliedDeckActiveIndex = deck?.activeIndex
                 
                 //node.textNode?.textNode.displaysAsynchronously = !arguments.presentationData.isPreview
                 
@@ -798,6 +933,9 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
                     
                     if let updateImageSignal = updateImageSignal {
                         imageNode.setSignal(updateImageSignal)
+                    }
+                    if deck != nil, imageNode.contents == nil, let mediaId = updatedMediaReference?.media.id, let image = DeckThumbnailStore.shared.image(mediaId: mediaId, side: imageSide) {
+                        imageNode.contents = image.cgImage
                     }
                 } else if let imageNode = node.imageNode {
                     imageNode.removeFromSupernode()
@@ -894,7 +1032,7 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
                     node.contentNode.view.insertSubview(node.backgroundView, at: 0)
                 }
                 
-                let backgroundFrame = CGRect(origin: CGPoint(x: 0.0, y: 0.0), size: CGSize(width: realSize.width, height: realSize.height))
+                let backgroundFrame = CGRect(origin: CGPoint(x: 0.0, y: 0.0), size: CGSize(width: realSize.width - deckEdgeSpace, height: deck == nil ? realSize.height : mainCardHeight))
                 
                 node.backgroundView.frame = backgroundFrame
                 
@@ -1011,7 +1149,159 @@ public class ChatMessageReplyInfoNode: ASDisplayNode {
                     starsView.removeFromSuperview()
                 }
                 
+                if let deck, let deckCounterText {
+                    let deckCounterLabel: UILabel
+                    if let current = node.deckCounterLabel {
+                        deckCounterLabel = current
+                    } else {
+                        deckCounterLabel = UILabel()
+                        deckCounterLabel.textAlignment = .center
+                        deckCounterLabel.clipsToBounds = true
+                        deckCounterLabel.layer.cornerRadius = 8.0
+                        node.deckCounterLabel = deckCounterLabel
+                        node.contentNode.view.addSubview(deckCounterLabel)
+                    }
+                    deckCounterLabel.font = deckCounterFont
+                    deckCounterLabel.textColor = mainColor
+                    deckCounterLabel.backgroundColor = mainColor.withMultipliedAlpha(0.2)
+                    if deckCounterLabel.text != nil && deckCounterLabel.attributedText?.string.hasPrefix(deckCounterText) != true {
+                        deckCounterLabel.layer.animateScale(from: 0.8, to: 1.0, duration: 0.2)
+                    }
+                    deckCounterLabel.attributedText = deckCounterString(text: deckCounterText, font: deckCounterFont, color: mainColor, withCollapseChevron: deck.isExpanded)
+                    let deckCounterFrame = CGRect(origin: CGPoint(x: backgroundFrame.maxX - deckCounterSize.width - 4.0, y: backgroundFrame.minY + 4.0), size: deckCounterSize)
+                    deckCounterLabel.frame = deckCounterFrame
+                    node.deckCounterFrame = deckCounterFrame
+                    
+                    // The quote background is translucent, so the cards behind it are drawn as one image cut out under the cards in front
+                    let stackCount = deck.isExpanded ? 0 : min(deck.messageIds.count - 1, 2)
+                    let deckStackView: UIImageView
+                    if let current = node.deckStackView {
+                        deckStackView = current
+                    } else {
+                        deckStackView = UIImageView()
+                        node.contentNode.view.insertSubview(deckStackView, at: 0)
+                        node.deckStackView = deckStackView
+                    }
+                    deckStackView.isHidden = stackCount == 0
+                    if stackCount != 0 {
+                        let stackSize = CGSize(width: backgroundFrame.width + CGFloat(stackCount) * deckCardShift, height: backgroundFrame.height + CGFloat(stackCount) * deckCardShift)
+                        deckStackView.frame = CGRect(origin: backgroundFrame.origin, size: stackSize)
+                        let imageKey = DeckStackImageKey(size: stackSize, cardSize: backgroundFrame.size, count: stackCount, color: mainColor.argb)
+                        if node.deckStackImageKey != imageKey {
+                            node.deckStackImageKey = imageKey
+                            deckStackView.image = generateDeckStackImage(size: stackSize, cardSize: backgroundFrame.size, count: stackCount, color: mainColor)
+                        }
+                    }
+                } else {
+                    node.deckCounterLabel?.removeFromSuperview()
+                    node.deckCounterLabel = nil
+                    node.deckCounterFrame = nil
+                    node.deckStackView?.removeFromSuperview()
+                    node.deckStackView = nil
+                    node.deckStackImageKey = nil
+                }
+                
                 node.contentNode.frame = CGRect(origin: CGPoint(), size: size)
+                
+                for thumbnail in deckThumbnails {
+                    let mediaId = thumbnail.mediaId
+                    DeckThumbnailStore.shared.load(thumbnail, side: imageSide, emptyColor: placeholderColor, observer: node, update: { [weak node] image in
+                        guard let node else {
+                            return
+                        }
+                        for rowItem in node.deckRowItems where rowItem.thumbnailMediaId == mediaId {
+                            rowItem.imageView.image = image
+                        }
+                        if let imageNode = node.imageNode, imageNode.contents == nil, node.previousMediaReference?.media.id == mediaId {
+                            imageNode.contents = image.cgImage
+                        }
+                    })
+                }
+                
+                node.deckCardTargets = deck.flatMap { [(messageId: $0.messageIds[0], frame: backgroundFrame)] } ?? []
+                var rowY = backgroundFrame.maxY
+                for (index, row) in deckRows.enumerated() {
+                    rowY += deckRowSpacing
+                    let rowFrame = CGRect(x: 0.0, y: rowY, width: backgroundFrame.width, height: row.height)
+                    rowY += row.height
+                    
+                    let rowItem: DeckRowItem
+                    var isNewRow = false
+                    if index < node.deckRowItems.count {
+                        rowItem = node.deckRowItems[index]
+                    } else {
+                        rowItem = DeckRowItem()
+                        node.contentNode.view.addSubview(rowItem.containerView)
+                        node.deckRowItems.append(rowItem)
+                        isNewRow = true
+                    }
+                    if isNewRow {
+                        rowItem.containerView.frame = rowFrame
+                    } else {
+                        animation.animator.updateFrame(layer: rowItem.containerView.layer, frame: rowFrame, completion: nil)
+                    }
+                    rowItem.backgroundView.frame = CGRect(origin: CGPoint(), size: rowFrame.size)
+                    rowItem.backgroundView.update(size: rowFrame.size, isTransparent: false, primaryColor: row.color, secondaryColor: row.secondaryColor, thirdColor: row.tertiaryColor, backgroundColor: nil, pattern: nil, animation: isNewRow ? .None : animation)
+                    
+                    var rowTextLeftInset = deckRowLeftInset
+                    rowItem.thumbnailMediaId = row.thumbnailMediaId
+                    if let thumbnailMediaId = row.thumbnailMediaId {
+                        rowItem.imageView.isHidden = false
+                        rowItem.imageView.image = DeckThumbnailStore.shared.image(mediaId: thumbnailMediaId, side: imageSide)
+                        rowItem.imageView.frame = CGRect(origin: CGPoint(x: 9.0, y: 4.0), size: deckThumbnailBoundingSize)
+                        rowTextLeftInset += imageSide + 6.0
+                    } else {
+                        rowItem.imageView.isHidden = true
+                        rowItem.imageView.image = nil
+                    }
+                    
+                    let rowTitleNode = row.titleApply()
+                    rowTitleNode.displaysAsynchronously = false
+                    rowTitleNode.frame = CGRect(origin: CGPoint(x: rowTextLeftInset - textInsets.left - 2.0, y: spacing - textInsets.top + 1.0), size: row.titleLayout.size)
+                    if rowItem.titleNode !== rowTitleNode {
+                        rowItem.titleNode?.view.removeFromSuperview()
+                        rowItem.titleNode = rowTitleNode
+                        rowItem.containerView.addSubview(rowTitleNode.view)
+                    }
+                    let rowTextNode = row.textApply()
+                    rowTextNode.displaysAsynchronously = false
+                    rowTextNode.frame = CGRect(origin: CGPoint(x: rowTextLeftInset - textInsets.left - 2.0, y: rowTitleNode.frame.maxY - textInsets.bottom + spacing - textInsets.top - 2.0), size: row.textLayout.size)
+                    if rowItem.textNode !== rowTextNode {
+                        rowItem.textNode?.view.removeFromSuperview()
+                        rowItem.textNode = rowTextNode
+                        rowItem.containerView.addSubview(rowTextNode.view)
+                    }
+                    
+                    node.deckCardTargets.append((messageId: row.messageId, frame: rowFrame))
+                    
+                    if isExpanding {
+                        // Cards fan out from underneath the main card
+                        let delay = 0.04 * Double(index)
+                        rowItem.containerView.layer.animateSpring(from: NSValue(cgPoint: CGPoint(x: 0.0, y: (backgroundFrame.maxY - rowFrame.minY) * 0.6)), to: NSValue(cgPoint: CGPoint()), keyPath: "position", duration: 0.5, delay: delay, additive: true)
+                        rowItem.containerView.layer.animateSpring(from: 0.9 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.5, delay: delay)
+                        rowItem.containerView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2, delay: delay)
+                    }
+                }
+                if node.deckRowItems.count > deckRows.count {
+                    let removedItems = node.deckRowItems[deckRows.count...]
+                    node.deckRowItems.removeLast(node.deckRowItems.count - deckRows.count)
+                    for rowItem in removedItems {
+                        if isSameDeck {
+                            // Cards slide back underneath the main card
+                            let containerView = rowItem.containerView
+                            containerView.layer.animatePosition(from: CGPoint(), to: CGPoint(x: 0.0, y: backgroundFrame.maxY - containerView.frame.maxY), duration: 0.25, removeOnCompletion: false, additive: true)
+                            containerView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.2, removeOnCompletion: false, completion: { [weak containerView] _ in
+                                containerView?.removeFromSuperview()
+                            })
+                        } else {
+                            rowItem.containerView.removeFromSuperview()
+                        }
+                    }
+                }
+                
+                if let deckSnapshotView {
+                    animateDeckCardSwitch(containerView: node.view, contentView: node.contentNode.view, snapshotView: deckSnapshotView)
+                }
                 
                 return node
             })
@@ -1243,4 +1533,219 @@ private final class StarsView: UIView {
         self.staticEmitterLayer.emitterPosition = emitterPosition
         self.staticEmitterLayer.setValue(emitterPosition, forKeyPath: "emitterBehaviors.attractor.position")
     }
+}
+
+// The outgoing card is swiped away while the next one rises from underneath it
+private func animateDeckCardSwitch(containerView: UIView, contentView: UIView, snapshotView: UIView) {
+    snapshotView.frame = CGRect(origin: CGPoint(), size: snapshotView.bounds.size)
+    containerView.addSubview(snapshotView)
+    snapshotView.layer.animatePosition(from: CGPoint(), to: CGPoint(x: 0.0, y: -14.0), duration: 0.25, timingFunction: CAMediaTimingFunctionName.easeIn.rawValue, removeOnCompletion: false, additive: true)
+    snapshotView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.25, removeOnCompletion: false, completion: { [weak snapshotView] _ in
+        snapshotView?.removeFromSuperview()
+    })
+    
+    contentView.layer.animateSpring(from: NSValue(cgPoint: CGPoint(x: 0.0, y: 10.0)), to: NSValue(cgPoint: CGPoint()), keyPath: "position", duration: 0.45, additive: true)
+    contentView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
+}
+
+private func deckCounterString(text: String, font: UIFont, color: UIColor, withCollapseChevron: Bool) -> NSAttributedString {
+    let result = NSMutableAttributedString(string: text, attributes: [.font: font, .foregroundColor: color])
+    if withCollapseChevron, let chevron = UIImage(systemName: "chevron.up", withConfiguration: UIImage.SymbolConfiguration(pointSize: font.pointSize - 2.0, weight: .bold))?.withTintColor(color, renderingMode: .alwaysOriginal) {
+        let attachment = NSTextAttachment()
+        attachment.image = chevron
+        attachment.bounds = CGRect(origin: CGPoint(x: 0.0, y: floor((font.capHeight - chevron.size.height) * 0.5)), size: chevron.size)
+        result.append(NSAttributedString(string: " ", attributes: [.font: font]))
+        result.append(NSAttributedString(attachment: attachment))
+    }
+    return result
+}
+
+private final class DeckRowItem {
+    let containerView: UIView
+    let backgroundView: MessageInlineBlockBackgroundView
+    let imageView: UIImageView
+    var titleNode: TextNode?
+    var textNode: TextNode?
+    var thumbnailMediaId: EngineMedia.Id?
+    
+    init() {
+        self.containerView = UIView()
+        self.containerView.isUserInteractionEnabled = false
+        self.backgroundView = MessageInlineBlockBackgroundView()
+        self.containerView.addSubview(self.backgroundView)
+        self.imageView = UIImageView()
+        self.containerView.addSubview(self.imageView)
+    }
+}
+
+private struct DeckCardThumbnail {
+    let mediaId: EngineMedia.Id
+    let dimensions: CGSize
+    let signal: Signal<(TransformImageArguments) -> DrawingContext?, NoError>
+    // A photo's file once it is on disk: drawn straight from it, which does not wait for the preview cache
+    let localData: Signal<Data, NoError>?
+}
+
+// Previews of deck cards, rendered as soon as a deck is shown so that a card flipped to or listed has its preview
+// at once. Kept outside the node: a bubble may lay its header out into a fresh node, and a load restarted on
+// every layout pass would never finish. Main thread only.
+private final class DeckThumbnailStore {
+    static let shared = DeckThumbnailStore()
+    
+    private struct Key: Hashable {
+        let mediaId: EngineMedia.Id
+        let side: CGFloat
+    }
+    
+    private var images: [Key: UIImage] = [:]
+    private var loads: [Key: Disposable] = [:]
+    private var localLoads: [Key: Disposable] = [:]
+    private var observers: [Key: [ObjectIdentifier: (UIImage) -> Void]] = [:]
+    
+    func image(mediaId: EngineMedia.Id, side: CGFloat) -> UIImage? {
+        return self.images[Key(mediaId: mediaId, side: side)]
+    }
+    
+    func load(_ thumbnail: DeckCardThumbnail, side: CGFloat, emptyColor: UIColor, observer: AnyObject, update: @escaping (UIImage) -> Void) {
+        let key = Key(mediaId: thumbnail.mediaId, side: side)
+        self.observers[key, default: [:]][ObjectIdentifier(observer)] = update
+        if self.loads[key] != nil {
+            return
+        }
+        if self.loads.count >= 64 {
+            for (_, disposable) in self.loads {
+                disposable.dispose()
+            }
+            self.loads.removeAll()
+            for (_, disposable) in self.localLoads {
+                disposable.dispose()
+            }
+            self.localLoads.removeAll()
+            self.images.removeAll()
+            self.observers = [key: self.observers[key] ?? [:]]
+        }
+        self.start(key: key, thumbnail: thumbnail, emptyColor: emptyColor, attempt: 0)
+    }
+    
+    private func start(key: Key, thumbnail: DeckCardThumbnail, emptyColor: UIColor, attempt: Int) {
+        let boundingSize = CGSize(width: key.side, height: key.side)
+        let arguments = TransformImageArguments(corners: ImageCorners(radius: 4.0), imageSize: thumbnail.dimensions.aspectFilled(boundingSize), boundingSize: boundingSize, intrinsicInsets: UIEdgeInsets(), emptyColor: emptyColor)
+        // A load now and then never reports back; one that has produced nothing after a moment is started again
+        if attempt < 10 {
+            Queue.mainQueue().after(0.4, { [weak self] in
+                guard let self, self.images[key] == nil, let disposable = self.loads[key] else {
+                    return
+                }
+                disposable.dispose()
+                self.start(key: key, thumbnail: thumbnail, emptyColor: emptyColor, attempt: attempt + 1)
+            })
+        }
+        if let localData = thumbnail.localData, self.localLoads[key] == nil {
+            self.localLoads[key] = (localData
+            |> map { data -> UIImage? in
+                guard let source = UIImage(data: data), source.size.width > 0.0, source.size.height > 0.0 else {
+                    return nil
+                }
+                let scale = max(boundingSize.width / source.size.width, boundingSize.height / source.size.height)
+                let drawSize = CGSize(width: source.size.width * scale, height: source.size.height * scale)
+                let format = UIGraphicsImageRendererFormat()
+                format.scale = UIScreenScale
+                return UIGraphicsImageRenderer(size: boundingSize, format: format).image { _ in
+                    UIBezierPath(roundedRect: CGRect(origin: CGPoint(), size: boundingSize), cornerRadius: 4.0).addClip()
+                    source.draw(in: CGRect(origin: CGPoint(x: (boundingSize.width - drawSize.width) / 2.0, y: (boundingSize.height - drawSize.height) / 2.0), size: drawSize))
+                }
+            }
+            ).startStrict(next: { [weak self] image in
+                guard let self, let image, self.images[key] == nil else {
+                    return
+                }
+                self.images[key] = image
+                for (_, update) in self.observers[key] ?? [:] {
+                    update(image)
+                }
+            })
+        }
+        // Kept running: a sharper version replaces the first one when the full-size photo arrives
+        self.loads[key] = (thumbnail.signal
+        |> deliverOn(Queue.concurrentDefaultQueue())
+        |> map { transform -> UIImage? in
+            let result = transform(arguments)?.generateImage()
+            return result
+        }
+        |> deliverOnMainQueue).startStrict(next: { [weak self] image in
+            guard let self, let image else {
+                return
+            }
+            self.images[key] = image
+            for (_, update) in self.observers[key] ?? [:] {
+                update(image)
+            }
+        })
+    }
+}
+
+// The preview a deck card shows, as a regular reply does: a photo, or a video's frame
+private func deckCardThumbnail(context: AccountContext, message: EngineRawMessage) -> DeckCardThumbnail? {
+    if message.containsSecretMedia {
+        return nil
+    }
+    let hasSpoiler = message.attributes.contains(where: { $0 is MediaSpoilerMessageAttribute })
+    for media in message.media {
+        if let image = media as? TelegramMediaImage, let imageId = image.id, let representation = largestRepresentationForPhoto(image) {
+            return DeckCardThumbnail(mediaId: imageId, dimensions: representation.dimensions.cgSize, signal: chatMessagePhotoThumbnail(account: context.account, userLocation: .peer(message.id.peerId), photoReference: .message(message: MessageReference(message), media: image), blurred: hasSpoiler), localData: hasSpoiler ? nil : deckLocalData(context: context, resource: representation.resource))
+        } else if let file = media as? TelegramMediaFile, file.isVideo, !file.isVideoSticker, !file.isInstantVideo, let fileId = file.id, let dimensions = file.dimensions {
+            return DeckCardThumbnail(mediaId: fileId, dimensions: dimensions.cgSize, signal: chatMessageVideoThumbnail(account: context.account, userLocation: .peer(message.id.peerId), fileReference: .message(message: MessageReference(message), media: file), blurred: hasSpoiler), localData: nil)
+        }
+    }
+    return nil
+}
+
+private func deckLocalData(context: AccountContext, resource: TelegramMediaResource) -> Signal<Data, NoError> {
+    return context.account.postbox.mediaBox.resourceData(resource, option: .complete(waitUntilFetchStatus: false), attemptSynchronously: true)
+    |> filter { $0.complete }
+    |> take(1)
+    |> mapToSignal { data -> Signal<Data, NoError> in
+        if let loaded = try? Data(contentsOf: URL(fileURLWithPath: data.path), options: .mappedIfSafe) {
+            return .single(loaded)
+        }
+        return .complete()
+    }
+}
+
+private let deckCardShift: CGFloat = 4.0
+
+private struct DeckStackImageKey: Equatable {
+    let size: CGSize
+    let cardSize: CGSize
+    let count: Int
+    let color: UInt32
+}
+
+// Each card is shifted right and down by `deckCardShift` from the one in front of it
+private func generateDeckStackImage(size: CGSize, cardSize: CGSize, count: Int, color: UIColor) -> UIImage? {
+    return generateImage(size, rotatedContext: { size, context in
+        context.clear(CGRect(origin: CGPoint(), size: size))
+        let cornerRadius: CGFloat = 4.0
+        for index in stride(from: count, through: 0, by: -1) {
+            let cardRect = CGRect(origin: CGPoint(x: CGFloat(index) * deckCardShift, y: CGFloat(index) * deckCardShift), size: cardSize)
+            let cardPath = UIBezierPath(roundedRect: cardRect, cornerRadius: cornerRadius).cgPath
+            
+            context.setBlendMode(.clear)
+            context.addPath(cardPath)
+            context.fillPath()
+            context.setBlendMode(.normal)
+            
+            if index == 0 {
+                break
+            }
+            context.saveGState()
+            context.addPath(cardPath)
+            context.clip()
+            context.setFillColor(color.withMultipliedAlpha(index == 1 ? 0.16 : 0.1).cgColor)
+            context.fill(cardRect)
+            context.setFillColor(color.withMultipliedAlpha(index == 1 ? 0.6 : 0.35).cgColor)
+            context.fill(CGRect(x: cardRect.minX, y: cardRect.minY, width: 3.0, height: cardRect.height))
+            context.restoreGState()
+        }
+    })
 }

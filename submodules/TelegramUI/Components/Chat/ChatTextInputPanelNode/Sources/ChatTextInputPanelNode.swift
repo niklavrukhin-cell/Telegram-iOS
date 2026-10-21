@@ -3045,6 +3045,7 @@ public class ChatTextInputPanelNode: ChatInputPanelNode, ASEditableTextNodeDeleg
                         dateTimeFormat: interfaceState.dateTimeFormat
                     )
                 },
+                forceUpdate: (accessoryPanelView.view as? ChatInputAccessoryPanelView)?.needsLayoutUpdate ?? false,
                 containerSize: CGSize(width: textInputWidth, height: 10000.0)
             )
             

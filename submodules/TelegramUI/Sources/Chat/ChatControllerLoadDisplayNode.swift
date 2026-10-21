@@ -1042,6 +1042,7 @@ extension ChatControllerImpl {
                 
                 let effectiveSilentPosting = silentPosting ?? strongSelf.presentationInterfaceState.interfaceState.silentPosting
                 let transformedMessages = strongSelf.transformEnqueueMessages(messages, silentPosting: effectiveSilentPosting, scheduleTime: scheduleTime, repeatPeriod: repeatPeriod, postpone: postpone)
+                let multiReplyTargets = strongSelf.takeMultiReplyTargets(transformedMessages)
                 
                 var forwardedMessages: [[EnqueueMessage]] = []
                 var forwardSourcePeerIds = Set<PeerId>()
@@ -1115,6 +1116,9 @@ extension ChatControllerImpl {
                     |> deliverOnMainQueue).startStandalone(next: { messageIds in
                         guard let strongSelf = self else {
                             return
+                        }
+                        if forwardSourcePeerIds.count <= 1 {
+                            strongSelf.registerMultiReplies(multiReplyTargets, messageIds: messageIds)
                         }
                         if case .scheduledMessages = strongSelf.presentationInterfaceState.subject {
                         } else {
@@ -1698,6 +1702,7 @@ extension ChatControllerImpl {
                 if canSendMessagesHere {
                     let _ = strongSelf.presentVoiceMessageDiscardAlert(action: {
                         if let message = strongSelf.chatDisplayNode.historyNode.messageInCurrentHistoryView(messageId)?._asMessage() {
+                            MultiReplyStore.shared.clearPendingDeck(peerId: message.id.peerId)
                             strongSelf.updateChatPresentationInterfaceState(animated: true, interactive: true, { $0.updatedInterfaceState({
                                 $0.withUpdatedReplyMessageSubject(ChatInterfaceState.ReplyMessageSubject(
                                     messageId: message.id,
@@ -1743,6 +1748,9 @@ extension ChatControllerImpl {
                     })
                 }
             } else {
+                if let peerId = strongSelf.presentationInterfaceState.interfaceState.replyMessageSubject?.messageId.peerId {
+                    MultiReplyStore.shared.clearPendingDeck(peerId: peerId)
+                }
                 strongSelf.updateChatPresentationInterfaceState(animated: true, interactive: true, { $0.updatedInterfaceState({ $0.withUpdatedReplyMessageSubject(nil).withUpdatedSendMessageEffect(nil).withUpdatedPostSuggestionState(nil) }) }, completion: { t in
                     completion(t, {})
                 })
@@ -4866,7 +4874,24 @@ extension ChatControllerImpl {
             }
         }, chatController: { [weak self] in
             return self
-        }, statuses: ChatPanelInterfaceInteractionStatuses(editingMessage: self.editingMessage.get(), startingBot: self.startingBot.get(), unblockingPeer: self.unblockingPeer.get(), searching: self.searching.get(), loadingMessage: self.loadingMessage.get(), inlineSearch: self.performingInlineSearch.get()))
+        }, statuses: ChatPanelInterfaceInteractionStatuses(editingMessage: self.editingMessage.get(), startingBot: self.startingBot.get(), unblockingPeer: self.unblockingPeer.get(), searching: self.searching.get(), loadingMessage: self.loadingMessage.get(), inlineSearch: self.performingInlineSearch.get()), replyToSelectedMessages: { [weak self] in
+            guard let self, let selectedIds = self.presentationInterfaceState.interfaceState.selectionState?.selectedIds, (2 ... MultiReplyStore.maxMessageCount).contains(selectedIds.count) else {
+                return
+            }
+            self.commitPurposefulAction()
+            self.updateReplyDeck(Array(selectedIds).sorted())
+            self.chatDisplayNode.ensureInputViewFocused()
+        }, removeReplyDeckMessage: { [weak self] messageId in
+            guard let self, let currentReply = self.presentationInterfaceState.interfaceState.replyMessageSubject else {
+                return
+            }
+            let deckMessageIds = ([currentReply.messageId] + (currentReply.extraMessageIds ?? [])).filter { $0 != messageId }
+            if deckMessageIds.isEmpty {
+                self.interfaceInteraction?.setupReplyMessage(nil, nil, { _, f in f() })
+            } else {
+                self.updateReplyDeck(deckMessageIds, innerSubject: currentReply.innerSubject)
+            }
+        })
         
         self.interfaceInteraction = interfaceInteraction
         

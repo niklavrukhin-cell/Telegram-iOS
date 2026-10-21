@@ -219,7 +219,8 @@ func textInputAccessoryPanel(
                     id: replyMessageSubject.messageId,
                     quote: replyMessageSubject.quote,
                     innerSubject: replyMessageSubject.innerSubject,
-                    message: nil
+                    message: nil,
+                    extraIds: replyMessageSubject.extraMessageIds ?? []
                 )),
                 chatPeerId: chatPeerId,
                 action: { sourceView in
@@ -235,6 +236,12 @@ func textInputAccessoryPanel(
                 },
                 dismiss: { _ in
                     interfaceInteraction?.setupReplyMessage(nil, nil, { _, f in f() })
+                },
+                requestLayout: {
+                    interfaceInteraction?.requestLayout(.animated(duration: 0.4, curve: .spring))
+                },
+                dismissDeckCard: { messageId in
+                    interfaceInteraction?.removeReplyDeckMessage(messageId)
                 }
             )))
         } else {

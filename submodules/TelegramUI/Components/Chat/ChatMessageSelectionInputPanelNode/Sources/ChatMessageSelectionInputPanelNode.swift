@@ -107,13 +107,25 @@ private final class GlassButtonView: UIView {
         }
     }
     
+    // Centers a smaller icon (a 24pt context menu one) on the canvas the panel icons are drawn on
+    var iconCanvasSize: CGSize?
+    
     var icon: String? {
         didSet {
             if self.icon == oldValue {
                 return
             }
             if let icon = self.icon {
-                self.iconView.image = UIImage(bundleImageName: icon)?.withRenderingMode(.alwaysTemplate)
+                var image = UIImage(bundleImageName: icon)
+                if let iconCanvasSize = self.iconCanvasSize, let sourceImage = image {
+                    image = generateImage(iconCanvasSize, rotatedContext: { size, context in
+                        context.clear(CGRect(origin: CGPoint(), size: size))
+                        UIGraphicsPushContext(context)
+                        sourceImage.draw(at: CGPoint(x: floor((size.width - sourceImage.size.width) * 0.5), y: floor((size.height - sourceImage.size.height) * 0.5)))
+                        UIGraphicsPopContext()
+                    })
+                }
+                self.iconView.image = image?.withRenderingMode(.alwaysTemplate)
             } else {
                 self.iconView.image = nil
             }
@@ -181,7 +193,9 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
     private let deleteButton: GlassButtonView
     private let reportButton: GlassButtonView
     private let forwardButton: GlassButtonView
+    private let replyButton: GlassButtonView
     private let shareButton: GlassButtonView
+    private var laidOutButtons = Set<ObjectIdentifier>()
     private let tagButton: GlassButtonView
     private let tagEditButton: GlassButtonView
     
@@ -190,6 +204,8 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
     private var validLayout: (width: CGFloat, leftInset: CGFloat, rightInset: CGFloat, bottomInset: CGFloat, additionalSideInsets: UIEdgeInsets, maxHeight: CGFloat, maxOverlayHeight: CGFloat, metrics: LayoutMetrics, isSecondary: Bool, isMediaInputExpanded: Bool, deviceMetrics: DeviceMetrics)?
     private var presentationInterfaceState: ChatPresentationInterfaceState?
     private var actions: ChatAvailableMessageActions?
+    // Number of selected messages `actions` was computed for
+    private var actionsSelectionCount = 0
     
     private var theme: PresentationTheme
     private let peerMedia: Bool
@@ -225,6 +241,12 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
         self.forwardButton.isAccessibilityElement = true
         self.forwardButton.accessibilityLabel = strings.VoiceOver_MessageContextForward
         
+        self.replyButton = GlassButtonView()
+        self.replyButton.iconCanvasSize = CGSize(width: 30.0, height: 30.0)
+        self.replyButton.icon = "Chat/Context Menu/Reply"
+        self.replyButton.isAccessibilityElement = true
+        self.replyButton.accessibilityLabel = strings.Conversation_ContextMenuReply
+        
         self.shareButton = GlassButtonView()
         self.shareButton.icon = "Chat/Input/Accessory Panels/MessageSelectionAction"
         self.shareButton.isAccessibilityElement = true
@@ -247,6 +269,7 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
         self.view.addSubview(self.deleteButton)
         self.view.addSubview(self.reportButton)
         self.view.addSubview(self.forwardButton)
+        self.view.addSubview(self.replyButton)
         self.view.addSubview(self.shareButton)
         self.view.addSubview(self.tagButton)
         self.view.addSubview(self.tagEditButton)
@@ -259,6 +282,7 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
         self.deleteButton.button.addTarget(self, action: #selector(self.deleteButtonPressed), for: .touchUpInside)
         self.reportButton.button.addTarget(self, action: #selector(self.reportButtonPressed), for: .touchUpInside)
         self.forwardButton.button.addTarget(self, action: #selector(self.forwardButtonPressed), for: .touchUpInside)
+        self.replyButton.button.addTarget(self, action: #selector(self.replyButtonPressed), for: .touchUpInside)
         self.shareButton.button.addTarget(self, action: #selector(self.shareButtonPressed), for: .touchUpInside)
         self.tagButton.button.addTarget(self, action: #selector(self.tagButtonPressed), for: .touchUpInside)
         self.tagEditButton.button.addTarget(self, action: #selector(self.tagButtonPressed), for: .touchUpInside)
@@ -273,17 +297,24 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
         
         if self.selectedMessages.isEmpty {
             self.actions = nil
+            self.actionsSelectionCount = 0
             if let (width, leftInset, rightInset, bottomInset, additionalSideInsets, maxHeight, maxOverlayHeight, metrics, isSecondary, isMediaInputExpanded, deviceMetrics) = self.validLayout, let interfaceState = self.presentationInterfaceState {
                 let _ = self.updateLayout(width: width, leftInset: leftInset, rightInset: rightInset, bottomInset: bottomInset, additionalSideInsets: additionalSideInsets, maxHeight: maxHeight, maxOverlayHeight: maxOverlayHeight, isSecondary: isSecondary, transition: .immediate, interfaceState: interfaceState, metrics: metrics, deviceMetrics: deviceMetrics, isMediaInputExpanded: isMediaInputExpanded)
             }
             self.canDeleteMessagesDisposable.set(nil)
         } else if let context = self.context {
+            let selectionCount = self.selectedMessages.count
             self.canDeleteMessagesDisposable.set((context.sharedContext.chatAvailableMessageActions(engine: context.engine, accountPeerId: context.account.peerId, messageIds: self.selectedMessages, keepUpdated: true)
             |> deliverOnMainQueue).startStrict(next: { [weak self] actions in
                 if let strongSelf = self {
+                    // The button set follows this snapshot as a whole, so a selection change rearranges
+                    // the buttons in one animated pass instead of two (count first, actions later)
+                    let hadActions = strongSelf.actions != nil
                     strongSelf.actions = actions
+                    strongSelf.actionsSelectionCount = selectionCount
+                    let transition: ContainedViewLayoutTransition = hadActions ? .animated(duration: 0.3, curve: .spring) : .immediate
                     if let (width, leftInset, rightInset, bottomInset, additionalSideInsets, maxHeight, maxOverlayHeight: maxOverlayHeight, metrics, isSecondary, isMediaInputExpanded, deviceMetrics) = strongSelf.validLayout, let interfaceState = strongSelf.presentationInterfaceState {
-                        let _ = strongSelf.updateLayout(width: width, leftInset: leftInset, rightInset: rightInset, bottomInset: bottomInset, additionalSideInsets: additionalSideInsets, maxHeight: maxHeight, maxOverlayHeight: maxOverlayHeight, isSecondary: isSecondary, transition: .immediate, interfaceState: interfaceState, metrics: metrics, deviceMetrics: deviceMetrics, isMediaInputExpanded: isMediaInputExpanded)
+                        let _ = strongSelf.updateLayout(width: width, leftInset: leftInset, rightInset: rightInset, bottomInset: bottomInset, additionalSideInsets: additionalSideInsets, maxHeight: maxHeight, maxOverlayHeight: maxOverlayHeight, isSecondary: isSecondary, transition: transition, interfaceState: interfaceState, metrics: metrics, deviceMetrics: deviceMetrics, isMediaInputExpanded: isMediaInputExpanded)
                     }
                 }
             }))
@@ -313,6 +344,10 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
         } else if !self.forwardButton.isImplicitlyDisabled {
             self.interfaceInteraction?.forwardSelectedMessages()
         }
+    }
+    
+    @objc private func replyButtonPressed() {
+        self.interfaceInteraction?.replyToSelectedMessages()
     }
     
     @objc private func shareButtonPressed() {
@@ -526,7 +561,7 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
             tagButton = self.tagEditButton
         }
         
-        let buttons: [GlassButtonView]
+        var buttons: [GlassButtonView]
         if self.reportButton.isHidden {
             if let tagButton {
                 buttons = [
@@ -578,7 +613,38 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
             }
         }
         
+        let canReplyToSelected = !self.peerMedia && self.actions != nil && (2 ... MultiReplyStore.maxMessageCount).contains(self.actionsSelectionCount)
+        self.replyButton.isHidden = !canReplyToSelected
+        if canReplyToSelected {
+            // Kept apart from Forward, whose arrow it would otherwise be easy to mistake for it
+            buttons.insert(self.replyButton, at: buttons.firstIndex(where: { $0 === self.shareButton }) ?? (buttons.count - 1))
+        }
+        
         let buttonSize = CGSize(width: 40.0, height: 40.0)
+        
+        let previousLaidOutButtons = self.laidOutButtons
+        self.laidOutButtons = Set(buttons.map(ObjectIdentifier.init))
+        
+        // Buttons leaving the layout fade out in place instead of vanishing
+        let allButtons: [GlassButtonView] = [self.deleteButton, self.reportButton, self.tagButton, self.tagEditButton, self.shareButton, self.replyButton, self.forwardButton]
+        for button in allButtons where !self.laidOutButtons.contains(ObjectIdentifier(button)) && button.layer.animation(forKey: "opacity") != nil {
+            // Still fading out from an earlier pass; the flags above must not cut it short
+            button.isHidden = false
+        }
+        if transition.isAnimated {
+            for button in allButtons where previousLaidOutButtons.contains(ObjectIdentifier(button)) && !self.laidOutButtons.contains(ObjectIdentifier(button)) {
+                button.isHidden = false
+                button.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.2, removeOnCompletion: false, completion: { [weak self, weak button] _ in
+                    // A button that came back meanwhile owns its animations again
+                    guard let self, let button, !self.laidOutButtons.contains(ObjectIdentifier(button)) else {
+                        return
+                    }
+                    button.layer.removeAllAnimations()
+                    button.isHidden = true
+                })
+                button.layer.animateScale(from: 1.0, to: 0.01, duration: 0.2, removeOnCompletion: false)
+            }
+        }
         
         let availableWidth = width - leftInset - rightInset
         let spacing: CGFloat = floor((availableWidth - buttonSize.width * CGFloat(buttons.count)) / CGFloat(buttons.count - 1))
@@ -591,8 +657,20 @@ public final class ChatMessageSelectionInputPanelNode: ChatInputPanelNode {
             } else {
                 buttonFrame = CGRect(origin: CGPoint(x: offset, y: 0.0), size: buttonSize)
             }
-            transition.updateFrame(view: button, frame: buttonFrame)
-            button.update(theme: interfaceState.theme, preferClearGlass: interfaceState.preferredGlassType == .clear, size: buttonFrame.size, transition: ComponentTransition(transition))
+            // A button that was not in the previous layout keeps a stale frame (zero on first show),
+            // so animating from it makes the button fly in; place it directly and fade it in instead
+            let isAppearing = !previousLaidOutButtons.isEmpty && !previousLaidOutButtons.contains(ObjectIdentifier(button))
+            if isAppearing {
+                button.layer.removeAllAnimations()
+                button.frame = buttonFrame
+                if transition.isAnimated {
+                    button.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
+                    button.layer.animateScale(from: 0.01, to: 1.0, duration: 0.3)
+                }
+            } else {
+                transition.updateFrame(view: button, frame: buttonFrame)
+            }
+            button.update(theme: interfaceState.theme, preferClearGlass: interfaceState.preferredGlassType == .clear, size: buttonFrame.size, transition: isAppearing ? .immediate : ComponentTransition(transition))
             
             offset += buttonSize.width + spacing
         }

@@ -57,4 +57,12 @@ public protocol ChatInputAccessoryPanelView: UIView {
     var contentTintView: UIView { get }
     var storedFrameBeforeDismissed: CGRect? { get set }
     var transitionData: ChatInputAccessoryPanelTransitionData? { get }
+    // The panel changed size on its own, so the host must render it again even though its component is unchanged
+    var needsLayoutUpdate: Bool { get }
+}
+
+public extension ChatInputAccessoryPanelView {
+    var needsLayoutUpdate: Bool {
+        return false
+    }
 }

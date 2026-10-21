@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 import TelegramPresentationData
 import ChatInputAccessoryPanel
 import AccountContext
@@ -108,16 +109,21 @@ public final class ChatInputMessageAccessoryPanel: Component {
             public let quote: EngineMessageReplyQuote?
             public let innerSubject: EngineMessageReplyInnerSubject?
             public let message: EngineMessage?
+            public let extraIds: [EngineMessage.Id]
 
-            public init(id: EngineMessage.Id, quote: EngineMessageReplyQuote?, innerSubject: EngineMessageReplyInnerSubject?, message: EngineMessage?) {
+            public init(id: EngineMessage.Id, quote: EngineMessageReplyQuote?, innerSubject: EngineMessageReplyInnerSubject?, message: EngineMessage?, extraIds: [EngineMessage.Id] = []) {
                 self.id = id
                 self.quote = quote
                 self.innerSubject = innerSubject
                 self.message = message
+                self.extraIds = extraIds
             }
 
             public static func ==(lhs: Reply, rhs: Reply) -> Bool {
                 if lhs.id != rhs.id {
+                    return false
+                }
+                if lhs.extraIds != rhs.extraIds {
                     return false
                 }
                 if lhs.quote != rhs.quote {
@@ -227,6 +233,8 @@ public final class ChatInputMessageAccessoryPanel: Component {
     let action: ((UIView) -> Void)?
     let longPressAction: ((UIView) -> Void)?
     let dismiss: (UIView) -> Void
+    let requestLayout: (() -> Void)?
+    let dismissDeckCard: ((EngineMessage.Id) -> Void)?
 
     public init(
         context: AccountContext,
@@ -234,7 +242,9 @@ public final class ChatInputMessageAccessoryPanel: Component {
         chatPeerId: EnginePeer.Id?,
         action: ((UIView) -> Void)?,
         longPressAction: ((UIView) -> Void)? = nil,
-        dismiss: @escaping (UIView) -> Void
+        dismiss: @escaping (UIView) -> Void,
+        requestLayout: (() -> Void)? = nil,
+        dismissDeckCard: ((EngineMessage.Id) -> Void)? = nil
     ) {
         self.context = context
         self.contents = contents
@@ -242,6 +252,8 @@ public final class ChatInputMessageAccessoryPanel: Component {
         self.action = action
         self.longPressAction = longPressAction
         self.dismiss = dismiss
+        self.requestLayout = requestLayout
+        self.dismissDeckCard = dismissDeckCard
     }
 
     public static func ==(lhs: ChatInputMessageAccessoryPanel, rhs: ChatInputMessageAccessoryPanel) -> Bool {
@@ -282,6 +294,27 @@ public final class ChatInputMessageAccessoryPanel: Component {
         
         private var messages: [EngineMessage] = []
         private var contentDisposable: Disposable?
+        private var subscribedMessageIds: [EngineMessage.Id]?
+        
+        private var deckMessageIds: [EngineMessage.Id] = []
+        private var deckActiveIndex: Int = 0
+        private let deckCounterButton: HighlightTrackingButton
+        private let deckCounterLabel: UILabel
+        private var isDeckCardAppearancePending = false
+        private var isDeckExpanded = false
+        private var deckMessages: [EngineMessage.Id: EngineMessage] = [:]
+        private var deckDisposable: Disposable?
+        private var deckEdgeViews: [UIView] = []
+        private var deckRowViews: [EngineMessage.Id: DeckPanelRowView] = [:]
+        // Previews of the deck's photos and videos, rendered ahead so the list shows them as it opens
+        private var deckThumbnailImages: [EngineMedia.Id: UIImage] = [:]
+        private var deckThumbnailLoading = Set<EngineMedia.Id>()
+        private let deckThumbnailDisposables = DisposableDict<EngineMedia.Id>()
+        private let deckThumbnailLocalDisposables = DisposableDict<EngineMedia.Id>()
+        private var isCardHiddenByDeckList = false
+        private var lastPanelHeight: CGFloat?
+        // The deck, or the single reply left in an open list after the rest was removed
+        private var deckListMessageIds: [EngineMessage.Id] = []
         
         private var inlineTextStarImage: UIImage?
         private var inlineTextTonImage: (UIImage, UIColor)?
@@ -299,6 +332,7 @@ public final class ChatInputMessageAccessoryPanel: Component {
         }
         
         public var storedFrameBeforeDismissed: CGRect?
+        public private(set) var needsLayoutUpdate = false
         
         override public init(frame: CGRect) {
             self.contentTintView = UIView()
@@ -311,6 +345,16 @@ public final class ChatInputMessageAccessoryPanel: Component {
             self.titleNode = CompositeTextNode()
             self.titleNode.displaysAsynchronously = false
             
+            self.deckCounterButton = HighlightTrackingButton()
+            self.deckCounterButton.isHidden = true
+            self.deckCounterLabel = UILabel()
+            self.deckCounterLabel.textAlignment = .center
+            self.deckCounterLabel.clipsToBounds = true
+            self.deckCounterLabel.isUserInteractionEnabled = false
+            self.deckCounterLabel.font = Font.with(size: 12.0, weight: .semibold, traits: .monospacedNumbers)
+            self.deckCounterLabel.textColor = .white
+            self.deckCounterButton.addSubview(self.deckCounterLabel)
+            
             super.init(frame: frame)
             
             self.addSubview(self.lineView)
@@ -319,8 +363,10 @@ public final class ChatInputMessageAccessoryPanel: Component {
             self.addSubview(self.closeButtonIcon)
             self.contentTintView.addSubview(self.closeButtonIcon.tintMask)
             self.addSubview(self.closeButton)
+            self.addSubview(self.deckCounterButton)
             
             self.closeButton.addTarget(self, action: #selector(self.closeButtonPressed), for: .touchUpInside)
+            self.deckCounterButton.addTarget(self, action: #selector(self.deckCounterPressed), for: .touchUpInside)
             
             self.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(self.tapGesture(_:))))
 
@@ -335,6 +381,12 @@ public final class ChatInputMessageAccessoryPanel: Component {
         
         deinit {
             self.contentDisposable?.dispose()
+            self.deckDisposable?.dispose()
+            self.deckThumbnailDisposables.dispose()
+            self.deckThumbnailLocalDisposables.dispose()
+            if let recognizer = self.deckDismissGestureRecognizer {
+                recognizer.view?.removeGestureRecognizer(recognizer)
+            }
         }
         
         @objc private func tapGesture(_ recognizer: UITapGestureRecognizer) {
@@ -342,7 +394,48 @@ public final class ChatInputMessageAccessoryPanel: Component {
                 return
             }
             if case .ended = recognizer.state {
+                if !self.deckMessageIds.isEmpty || self.isDeckExpanded {
+                    if self.isDeckExpanded {
+                        self.setDeckExpanded(false)
+                    } else {
+                        self.deckCounterPressed()
+                    }
+                    return
+                }
                 component.action?(self)
+            }
+        }
+        
+        private var deckDismissGestureRecognizer: DeckDismissGestureRecognizer?
+        
+        // A recognizer on the window rather than a view over it: the window hit-tests through its own host
+        // and never reaches views added to it directly
+        private func updateDeckDismissRecognizer(isActive: Bool) {
+            if isActive, let window = self.window {
+                if let current = self.deckDismissGestureRecognizer, current.view === window {
+                    return
+                }
+                self.deckDismissGestureRecognizer.flatMap { $0.view?.removeGestureRecognizer($0) }
+                let recognizer = DeckDismissGestureRecognizer()
+                recognizer.panelView = self
+                recognizer.dismiss = { [weak self] in
+                    guard let self, self.isDeckExpanded else {
+                        return
+                    }
+                    self.setDeckExpanded(false)
+                }
+                window.addGestureRecognizer(recognizer)
+                self.deckDismissGestureRecognizer = recognizer
+            } else if let recognizer = self.deckDismissGestureRecognizer {
+                self.deckDismissGestureRecognizer = nil
+                recognizer.view?.removeGestureRecognizer(recognizer)
+            }
+        }
+        
+        override public func didMoveToWindow() {
+            super.didMoveToWindow()
+            if self.window == nil {
+                self.updateDeckDismissRecognizer(isActive: false)
             }
         }
         
@@ -351,42 +444,238 @@ public final class ChatInputMessageAccessoryPanel: Component {
                 return
             }
             if case .began = recognizer.state {
+                if !self.deckMessageIds.isEmpty {
+                    if !self.isDeckExpanded {
+                        HapticFeedback().impact(.light)
+                        self.layer.animateSpring(from: 0.96 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.5)
+                        self.setDeckExpanded(true)
+                    }
+                    return
+                }
                 component.longPressAction?(self)
             }
         }
 
+        private func setDeckExpanded(_ isExpanded: Bool) {
+            guard let component = self.component else {
+                return
+            }
+            if isExpanded && self.deckActiveIndex != 0 {
+                self.deckActiveIndex = 0
+            }
+            self.isDeckExpanded = isExpanded
+            if let requestLayout = component.requestLayout {
+                // The host does not render an unchanged component again
+                self.needsLayoutUpdate = true
+                requestLayout()
+            } else {
+                self.state?.updated(transition: .spring(duration: 0.4), isLocal: true)
+            }
+        }
+        
+        @objc private func deckCounterPressed() {
+            guard self.deckMessageIds.count > 1 else {
+                return
+            }
+            if self.isDeckExpanded {
+                self.setDeckExpanded(false)
+                return
+            }
+            self.deckActiveIndex = (self.deckActiveIndex + 1) % self.deckMessageIds.count
+            self.animateDeckCardChange(isRemoval: false)
+            
+            if !self.isUpdating {
+                self.state?.updated(transition: .immediate, isLocal: true)
+            }
+        }
+        
+        // The visible card is swiped away (or shrinks away when removed); the next one rises once its message is loaded
+        private func animateDeckCardChange(isRemoval: Bool) {
+            for contentView in [self.titleNode.view, self.text.view].compactMap({ $0 }) {
+                if let snapshotView = contentView.snapshotView(afterScreenUpdates: false) {
+                    snapshotView.frame = contentView.frame
+                    self.addSubview(snapshotView)
+                    if isRemoval {
+                        snapshotView.layer.anchorPoint = CGPoint(x: 0.0, y: 0.5)
+                        snapshotView.frame = contentView.frame
+                    }
+                    UIView.animate(withDuration: isRemoval ? 0.2 : 0.25, delay: 0.0, options: [.curveEaseIn], animations: {
+                        snapshotView.transform = isRemoval ? CGAffineTransform(scaleX: 0.85, y: 0.85) : CGAffineTransform(translationX: 0.0, y: -14.0)
+                        snapshotView.alpha = 0.0
+                    }, completion: { _ in
+                        snapshotView.removeFromSuperview()
+                    })
+                }
+                contentView.alpha = 0.0
+            }
+            self.isDeckCardAppearancePending = true
+            Queue.mainQueue().after(0.35) { [weak self] in
+                guard let self, self.isDeckCardAppearancePending else {
+                    return
+                }
+                self.isDeckCardAppearancePending = false
+                for contentView in [self.titleNode.view, self.text.view].compactMap({ $0 }) {
+                    contentView.alpha = 1.0
+                    contentView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
+                }
+            }
+            self.deckCounterLabel.layer.animateSpring(from: 0.8 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.4)
+        }
+        
         @objc private func closeButtonPressed() {
             guard let component = self.component else {
+                return
+            }
+            if !self.deckMessageIds.isEmpty, let dismissDeckCard = component.dismissDeckCard {
+                dismissDeckCard(self.deckMessageIds[self.deckActiveIndex])
                 return
             }
             component.dismiss(self)
         }
         
+        // A load now and then never reports back; one that has produced nothing after a moment is started again
+        private func loadDeckThumbnail(_ thumbnail: DeckPanelThumbnail, side: CGFloat, attempt: Int) {
+            let mediaId = thumbnail.mediaId
+            let boundingSize = CGSize(width: side, height: side)
+            let thumbnailArguments = TransformImageArguments(corners: ImageCorners(radius: 4.0), imageSize: thumbnail.dimensions.aspectFilled(boundingSize), boundingSize: boundingSize, intrinsicInsets: UIEdgeInsets())
+            if attempt < 10 {
+                Queue.mainQueue().after(0.4, { [weak self] in
+                    guard let self, self.deckThumbnailImages[mediaId] == nil, self.deckThumbnailLoading.contains(mediaId) else {
+                        return
+                    }
+                    self.loadDeckThumbnail(thumbnail, side: side, attempt: attempt + 1)
+                })
+            }
+            if let localData = thumbnail.localData {
+                self.deckThumbnailLocalDisposables.set((localData
+                |> map { data -> UIImage? in
+                    guard let source = UIImage(data: data), source.size.width > 0.0, source.size.height > 0.0 else {
+                        return nil
+                    }
+                    let scale = max(boundingSize.width / source.size.width, boundingSize.height / source.size.height)
+                    let drawSize = CGSize(width: source.size.width * scale, height: source.size.height * scale)
+                    let format = UIGraphicsImageRendererFormat()
+                    format.scale = UIScreenScale
+                    return UIGraphicsImageRenderer(size: boundingSize, format: format).image { _ in
+                        UIBezierPath(roundedRect: CGRect(origin: CGPoint(), size: boundingSize), cornerRadius: 4.0).addClip()
+                        source.draw(in: CGRect(origin: CGPoint(x: (boundingSize.width - drawSize.width) / 2.0, y: (boundingSize.height - drawSize.height) / 2.0), size: drawSize))
+                    }
+                }
+                ).startStrict(next: { [weak self] image in
+                    guard let self, let image, self.deckThumbnailImages[mediaId] == nil else {
+                        return
+                    }
+                    self.deckThumbnailImages[mediaId] = image
+                    for rowView in self.deckRowViews.values where rowView.thumbnailMediaId == mediaId {
+                        rowView.setThumbnail(image)
+                    }
+                }), forKey: mediaId)
+            }
+            self.deckThumbnailDisposables.set((thumbnail.signal
+            |> deliverOn(Queue.concurrentDefaultQueue())
+            |> map { transform -> UIImage? in
+                return transform(thumbnailArguments)?.generateImage()
+            }
+            |> deliverOnMainQueue).startStrict(next: { [weak self] image in
+                guard let self, let image else {
+                    return
+                }
+                self.deckThumbnailImages[mediaId] = image
+                for rowView in self.deckRowViews.values where rowView.thumbnailMediaId == mediaId {
+                    rowView.setThumbnail(image)
+                }
+            }), forKey: mediaId)
+        }
+        
         public func update(component: ChatInputMessageAccessoryPanel, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
             self.isUpdating = true
+            self.needsLayoutUpdate = false
             defer {
                 self.isUpdating = false
             }
             
             let environment = environment[EnvironmentType.self].value
             
-            let messageIdsFromComponent: (ChatInputMessageAccessoryPanel) -> [EngineMessage.Id] = { component in
-                let messageIds: [EngineMessage.Id]
-                switch component.contents {
-                case let .edit(edit):
-                    messageIds = [edit.id]
-                case let .reply(reply):
-                    messageIds = [reply.id]
-                case let .forward(forward):
-                    messageIds = forward.messageIds
-                case .linkPreview, .suggestPost:
-                    messageIds = []
+            var updatedDeckMessageIds: [EngineMessage.Id] = []
+            if case let .reply(reply) = component.contents, !reply.extraIds.isEmpty {
+                updatedDeckMessageIds = [reply.id] + reply.extraIds
+            }
+            let wasDeckExpanded = self.isDeckExpanded
+            if updatedDeckMessageIds != self.deckMessageIds {
+                var previousMessageIds = self.deckMessageIds
+                if previousMessageIds.isEmpty, let previousComponent = self.component, case let .reply(previousReply) = previousComponent.contents {
+                    previousMessageIds = [previousReply.id]
                 }
-                return messageIds
+                let previousActiveIndex = self.deckActiveIndex
+                let previousActiveId: EngineMessage.Id? = previousActiveIndex < previousMessageIds.count ? previousMessageIds[previousActiveIndex] : nil
+                
+                var currentMessageIds = updatedDeckMessageIds
+                if currentMessageIds.isEmpty, case let .reply(reply) = component.contents {
+                    currentMessageIds = [reply.id]
+                }
+                // Cards were removed from this deck, rather than a new reply set up
+                let isSameDeck = currentMessageIds.contains(where: { previousMessageIds.contains($0) })
+                
+                self.deckMessageIds = updatedDeckMessageIds
+                if updatedDeckMessageIds.isEmpty {
+                    self.deckActiveIndex = 0
+                } else if let previousActiveId, let index = updatedDeckMessageIds.firstIndex(of: previousActiveId) {
+                    self.deckActiveIndex = index
+                } else if isSameDeck {
+                    self.deckActiveIndex = min(previousActiveIndex, updatedDeckMessageIds.count - 1)
+                } else {
+                    self.deckActiveIndex = 0
+                }
+                
+                if !wasDeckExpanded, isSameDeck, let previousActiveId, !currentMessageIds.contains(previousActiveId) {
+                    self.animateDeckCardChange(isRemoval: true)
+                }
+                // An open list stays open while cards are removed from it, down to the last one
+                self.isDeckExpanded = wasDeckExpanded && !currentMessageIds.isEmpty
+                if self.isDeckExpanded {
+                    self.deckActiveIndex = 0
+                }
+                self.deckDisposable?.dispose()
+                // Remaining rows keep their messages while the new subscription catches up
+                self.deckMessages = self.deckMessages.filter { currentMessageIds.contains($0.key) }
+                if !updatedDeckMessageIds.isEmpty {
+                    self.deckDisposable = (component.context.engine.data.subscribe(
+                        EngineDataList(updatedDeckMessageIds.map { id in
+                            return TelegramEngine.EngineData.Item.Messages.Message(id: id)
+                        })
+                    )
+                    |> deliverOnMainQueue).startStrict(next: { [weak self] messages in
+                        guard let self else {
+                            return
+                        }
+                        var deckMessages: [EngineMessage.Id: EngineMessage] = [:]
+                        for message in messages {
+                            if let message {
+                                deckMessages[message.id] = message
+                            }
+                        }
+                        self.deckMessages = deckMessages
+                        if self.isDeckExpanded && !self.isUpdating {
+                            self.state?.updated(transition: .immediate, isLocal: true)
+                        }
+                    })
+                }
             }
             
-            let messageIds = messageIdsFromComponent(component)
-            if self.component == nil || self.component.flatMap(messageIdsFromComponent) != messageIds {
+            let messageIds: [EngineMessage.Id]
+            switch component.contents {
+            case let .edit(edit):
+                messageIds = [edit.id]
+            case let .reply(reply):
+                messageIds = self.deckMessageIds.isEmpty ? [reply.id] : [self.deckMessageIds[self.deckActiveIndex]]
+            case let .forward(forward):
+                messageIds = forward.messageIds
+            case .linkPreview, .suggestPost:
+                messageIds = []
+            }
+            
+            if self.subscribedMessageIds != messageIds {
+                self.subscribedMessageIds = messageIds
                 self.contentDisposable?.dispose()
                 if !messageIds.isEmpty {
                     self.contentDisposable = (component.context.engine.data.subscribe(
@@ -401,6 +690,14 @@ public final class ChatInputMessageAccessoryPanel: Component {
                         self.messages = messages.compactMap { $0 }
                         if !self.isUpdating {
                             self.state?.updated(transition: .immediate, isLocal: true)
+                        }
+                        if self.isDeckCardAppearancePending {
+                            self.isDeckCardAppearancePending = false
+                            for contentView in [self.titleNode.view, self.text.view].compactMap({ $0 }) {
+                                contentView.alpha = 1.0
+                                contentView.layer.animateSpring(from: NSValue(cgPoint: CGPoint(x: 0.0, y: 8.0)), to: NSValue(cgPoint: CGPoint()), keyPath: "position", duration: 0.5, additive: true)
+                                contentView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
+                            }
                         }
                     })
                 }
@@ -423,17 +720,31 @@ public final class ChatInputMessageAccessoryPanel: Component {
                 })?.withRenderingMode(.alwaysTemplate).stretchableImage(withLeftCapWidth: 0, topCapHeight: 1)
             }
             
-            let size = CGSize(width: availableSize.width, height: 52.0)
+            let cardHeight: CGFloat = 52.0
+            let deckRowHeight: CGFloat = 40.0
+            if case let .reply(reply) = component.contents {
+                self.deckListMessageIds = self.deckMessageIds.isEmpty ? [reply.id] : self.deckMessageIds
+            } else {
+                self.deckListMessageIds = []
+            }
+            let deckRowCount = self.isDeckExpanded ? self.deckListMessageIds.count : 0
+            let deckRowsTop: CGFloat = 6.0
+            let size: CGSize
+            if deckRowCount > 0 {
+                size = CGSize(width: availableSize.width, height: max(cardHeight, deckRowsTop * 2.0 + CGFloat(deckRowCount) * deckRowHeight))
+            } else {
+                size = CGSize(width: availableSize.width, height: cardHeight)
+            }
             
             let containerInsets = UIEdgeInsets(top: 8.0, left: 12.0, bottom: 6.0, right: 0.0)
             
-            let lineSize = CGSize(width: 2.0, height: size.height - containerInsets.top - containerInsets.bottom)
+            let lineSize = CGSize(width: 2.0, height: cardHeight - containerInsets.top - containerInsets.bottom)
             let lineFrame = CGRect(origin: CGPoint(x: containerInsets.left, y: containerInsets.top), size: lineSize)
             transition.setFrame(view: self.lineView, frame: lineFrame)
             self.lineView.tintColor = environment.theme.chat.inputPanel.panelControlAccentColor
             
             let closeButtonSize = CGSize(width: 44.0, height: 44.0)
-            let closeButtonFrame = CGRect(origin: CGPoint(x: availableSize.width - closeButtonSize.width, y: floor((size.height - closeButtonSize.height) * 0.5)), size: closeButtonSize)
+            let closeButtonFrame = CGRect(origin: CGPoint(x: availableSize.width - closeButtonSize.width, y: floor((cardHeight - closeButtonSize.height) * 0.5)), size: closeButtonSize)
             transition.setFrame(view: self.closeButton, frame: closeButtonFrame)
             
             if let image = self.closeButtonIcon.image {
@@ -911,7 +1222,59 @@ public final class ChatInputMessageAccessoryPanel: Component {
                 }
             }
             
-            let textInsets = UIEdgeInsets(top: 10.0, left: 8.0, bottom: 0.0, right: 44.0)
+            var textInsets = UIEdgeInsets(top: 10.0, left: 8.0, bottom: 0.0, right: 44.0)
+            
+            let accentColor = environment.theme.chat.inputPanel.panelControlAccentColor
+            if self.deckMessageIds.isEmpty {
+                self.deckCounterButton.isHidden = true
+                for edgeView in self.deckEdgeViews {
+                    edgeView.removeFromSuperview()
+                }
+                self.deckEdgeViews.removeAll()
+            } else {
+                if self.deckCounterButton.isHidden {
+                    self.deckCounterButton.isHidden = false
+                    if !transition.animation.isImmediate {
+                        self.deckCounterButton.layer.animateSpring(from: 0.4 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.5)
+                        self.deckCounterButton.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
+                    }
+                }
+                let counterFont = Font.with(size: 12.0, weight: .semibold, traits: .monospacedNumbers)
+                let counterText = "\(self.deckActiveIndex + 1)/\(self.deckMessageIds.count)"
+                self.deckCounterLabel.attributedText = NSAttributedString(string: counterText, attributes: [.font: counterFont, .foregroundColor: UIColor.white])
+                self.deckCounterLabel.backgroundColor = accentColor
+                let counterTextSize = self.deckCounterLabel.sizeThatFits(CGSize(width: 100.0, height: 20.0))
+                let counterSize = CGSize(width: max(20.0, ceil(counterTextSize.width) + 12.0), height: 20.0)
+                self.deckCounterLabel.layer.cornerRadius = counterSize.height * 0.5
+                let counterFrame = CGRect(origin: CGPoint(x: closeButtonFrame.minX - counterSize.width, y: floor((cardHeight - counterSize.height) * 0.5)), size: counterSize)
+                self.deckCounterButton.frame = counterFrame.insetBy(dx: -8.0, dy: -12.0)
+                self.deckCounterLabel.frame = CGRect(origin: CGPoint(x: 8.0, y: 12.0), size: counterSize)
+                textInsets.right += counterSize.width + 6.0
+                
+                // Edges of the cards behind peek out to the left of the reply line
+                let edgeCount = min(self.deckMessageIds.count - 1, 2)
+                while self.deckEdgeViews.count > edgeCount {
+                    self.deckEdgeViews.removeLast().removeFromSuperview()
+                }
+                while self.deckEdgeViews.count < edgeCount {
+                    let edgeView = UIView()
+                    edgeView.isUserInteractionEnabled = false
+                    edgeView.layer.cornerRadius = 1.0
+                    edgeView.alpha = self.isCardHiddenByDeckList ? 0.0 : 1.0
+                    self.insertSubview(edgeView, belowSubview: self.lineView)
+                    self.deckEdgeViews.append(edgeView)
+                    if !transition.animation.isImmediate {
+                        edgeView.layer.animateAlpha(from: 0.0, to: edgeView.alpha, duration: 0.25)
+                        edgeView.layer.animateSpring(from: NSValue(cgPoint: CGPoint(x: CGFloat(self.deckEdgeViews.count) * 4.0, y: 0.0)), to: NSValue(cgPoint: CGPoint()), keyPath: "position", duration: 0.5, additive: true)
+                    }
+                }
+                for (i, edgeView) in self.deckEdgeViews.enumerated() {
+                    let level = CGFloat(i + 1)
+                    let verticalInset = level * 5.0
+                    edgeView.backgroundColor = accentColor.withMultipliedAlpha(i == 0 ? 0.45 : 0.2)
+                    edgeView.frame = CGRect(x: lineFrame.minX - level * 4.0, y: lineFrame.minY + verticalInset, width: 2.0, height: max(2.0, lineFrame.height - verticalInset * 2.0))
+                }
+            }
             
             self.titleNode.components = titleText
             let titleSize = self.titleNode.update(constrainedSize: CGSize(width: availableSize.width - lineFrame.maxX - textInsets.left - textInsets.right, height: 100.0))
@@ -972,6 +1335,127 @@ public final class ChatInputMessageAccessoryPanel: Component {
                 tintTextView.bounds = CGRect(origin: CGPoint(), size: textFrame.size)
             }
             
+            // Only on a change, so that a card switch animation keeps control of the text alpha
+            if self.isCardHiddenByDeckList != (deckRowCount > 0) {
+                self.isCardHiddenByDeckList = deckRowCount > 0
+                let cardAlpha: CGFloat = deckRowCount > 0 ? 0.0 : 1.0
+                let cardTransition: ComponentTransition = transition.animation.isImmediate ? .immediate : (deckRowCount > 0 ? .easeInOut(duration: 0.12) : .easeInOut(duration: 0.25))
+                var cardViews: [UIView] = [self.lineView, self.titleNode.view, self.closeButton, self.closeButtonIcon, self.closeButtonIcon.tintMask, self.deckCounterButton]
+                cardViews.append(contentsOf: [self.text.view, self.tintText.view].compactMap { $0 })
+                cardViews.append(contentsOf: self.deckEdgeViews)
+                for cardView in cardViews {
+                    cardTransition.setAlpha(view: cardView, alpha: cardAlpha)
+                }
+            }
+            self.closeButton.isUserInteractionEnabled = deckRowCount == 0
+            self.deckCounterButton.isUserInteractionEnabled = deckRowCount == 0
+            self.updateDeckDismissRecognizer(isActive: deckRowCount > 0)
+            
+            // The panel sits on top of the input field: when it gets shorter, its content moves down
+            let panelHeightDecrease = max(0.0, (self.lastPanelHeight ?? size.height) - size.height)
+            self.lastPanelHeight = size.height
+            
+            let deckThumbnailSide: CGFloat = 32.0
+            for message in self.messages + Array(self.deckMessages.values) {
+                // The panel updates on every keystroke: a load already running is left to finish, not restarted
+                guard let thumbnail = deckPanelThumbnail(context: component.context, message: message), !self.deckThumbnailLoading.contains(thumbnail.mediaId) else {
+                    continue
+                }
+                self.deckThumbnailLoading.insert(thumbnail.mediaId)
+                self.loadDeckThumbnail(thumbnail, side: deckThumbnailSide, attempt: 0)
+            }
+            
+            var validRowIds = Set<EngineMessage.Id>()
+            if deckRowCount > 0 {
+                let isListAppearing = self.deckRowViews.isEmpty
+                for (index, messageId) in self.deckListMessageIds.enumerated() {
+                    validRowIds.insert(messageId)
+                    let rowFrame = CGRect(x: 0.0, y: deckRowsTop + CGFloat(index) * deckRowHeight, width: availableSize.width, height: deckRowHeight)
+                    
+                    let rowView: DeckPanelRowView
+                    var isNewRow = false
+                    if let current = self.deckRowViews[messageId] {
+                        rowView = current
+                        transition.setFrame(view: rowView, frame: rowFrame)
+                    } else {
+                        rowView = DeckPanelRowView()
+                        rowView.removeAction = { [weak self, weak rowView] in
+                            guard let self, let rowView, let messageId = rowView.messageId else {
+                                return
+                            }
+                            self.component?.dismissDeckCard?(messageId)
+                        }
+                        self.addSubview(rowView)
+                        self.deckRowViews[messageId] = rowView
+                        rowView.frame = rowFrame
+                        isNewRow = true
+                    }
+                    
+                    let message = self.deckMessages[messageId] ?? self.messages.first(where: { $0.id == messageId })
+                    rowView.messageId = messageId
+                    let rowThumbnailMediaId = message.flatMap { deckPanelThumbnail(context: component.context, message: $0)?.mediaId }
+                    rowView.thumbnailMediaId = rowThumbnailMediaId
+                    rowView.update(
+                        author: message?.author.flatMap { $0.displayTitle(strings: environment.strings, displayOrder: environment.nameDisplayOrder) } ?? " ",
+                        text: message.flatMap { message -> String? in
+                            let (description, _, _) = descriptionStringForMessage(
+                                contentSettings: component.context.currentContentSettings.with { $0 },
+                                message: message,
+                                strings: environment.strings,
+                                nameDisplayOrder: environment.nameDisplayOrder,
+                                dateTimeFormat: environment.dateTimeFormat,
+                                accountPeerId: component.context.account.peerId
+                            )
+                            let text = description.string.replacingOccurrences(of: "\n", with: " ")
+                            return text.isEmpty ? nil : text
+                        } ?? " ",
+                        accentColor: accentColor,
+                        textColor: environment.theme.chat.inputPanel.primaryTextColor,
+                        removeIconColor: environment.theme.chat.inputPanel.inputControlColor,
+                        canRemove: component.dismissDeckCard != nil,
+                        removeButtonWidth: closeButtonSize.width,
+                        lineX: lineFrame.minX,
+                        textX: lineFrame.maxX + textInsets.left,
+                        rowHeight: deckRowHeight,
+                        thumbnailSide: rowThumbnailMediaId != nil ? deckThumbnailSide : nil
+                    )
+                    rowView.setThumbnail(rowThumbnailMediaId.flatMap { self.deckThumbnailImages[$0] })
+                    
+                    if isNewRow {
+                        if isListAppearing && index == 0 {
+                            rowView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.15)
+                        } else if isListAppearing {
+                            let delay = 0.035 * Double(index - 1)
+                            rowView.layer.animateSpring(from: NSValue(cgPoint: CGPoint(x: 0.0, y: deckRowsTop - rowFrame.minY)), to: NSValue(cgPoint: CGPoint()), keyPath: "position", duration: 0.5, delay: delay, additive: true)
+                            rowView.layer.animateSpring(from: 0.92 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.5, delay: delay)
+                            rowView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2, delay: delay)
+                        } else {
+                            rowView.layer.animateSpring(from: 0.85 as NSNumber, to: 1.0 as NSNumber, keyPath: "transform.scale", duration: 0.45)
+                            rowView.layer.animateAlpha(from: 0.0, to: 1.0, duration: 0.2)
+                        }
+                    }
+                    rowView.setWobbling(true)
+                }
+            }
+            for (messageId, rowView) in self.deckRowViews where !validRowIds.contains(messageId) {
+                self.deckRowViews[messageId] = nil
+                rowView.setWobbling(false)
+                rowView.isUserInteractionEnabled = false
+                if deckRowCount > 0 {
+                    transition.setFrame(view: rowView, frame: rowView.frame.offsetBy(dx: 0.0, dy: -panelHeightDecrease))
+                    rowView.layer.animateScale(from: 1.0, to: 0.85, duration: 0.2, removeOnCompletion: false)
+                    rowView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.18, removeOnCompletion: false, completion: { [weak rowView] _ in
+                        rowView?.removeFromSuperview()
+                    })
+                } else {
+                    rowView.layer.animatePosition(from: CGPoint(), to: CGPoint(x: 0.0, y: deckRowsTop - rowView.frame.minY), duration: 0.25, timingFunction: CAMediaTimingFunctionName.easeIn.rawValue, removeOnCompletion: false, additive: true)
+                    rowView.layer.animateScale(from: 1.0, to: 0.94, duration: 0.25, removeOnCompletion: false)
+                    rowView.layer.animateAlpha(from: 1.0, to: 0.0, duration: 0.2, removeOnCompletion: false, completion: { [weak rowView] _ in
+                        rowView?.removeFromSuperview()
+                    })
+                }
+            }
+            
             return size
         }
     }
@@ -982,5 +1466,184 @@ public final class ChatInputMessageAccessoryPanel: Component {
     
     public func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
         return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
+    }
+}
+
+private final class DeckPanelRowView: UIView {
+    private let lineView = UIView()
+    private let authorLabel = UILabel()
+    private let textLabel = UILabel()
+    private let removeButton = HighlightTrackingButton()
+    private let removeIconView = UIImageView()
+    private let thumbnailView = UIImageView()
+    
+    var messageId: EngineMessage.Id?
+    var thumbnailMediaId: EngineMedia.Id?
+    var removeAction: (() -> Void)?
+    
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        
+        self.lineView.layer.cornerRadius = 1.0
+        self.removeIconView.image = generateCloseIcon().withRenderingMode(.alwaysTemplate)
+        self.removeIconView.isUserInteractionEnabled = false
+        self.removeButton.addSubview(self.removeIconView)
+        self.removeButton.addTarget(self, action: #selector(self.removeButtonPressed), for: .touchUpInside)
+        self.removeButton.highligthedChanged = { [weak self] highlighted in
+            self?.removeIconView.alpha = highlighted ? 0.4 : 1.0
+        }
+        self.authorLabel.font = Font.medium(15.0)
+        self.textLabel.font = Font.regular(15.0)
+        self.addSubview(self.lineView)
+        self.addSubview(self.authorLabel)
+        self.addSubview(self.textLabel)
+        self.addSubview(self.thumbnailView)
+        self.addSubview(self.removeButton)
+    }
+    
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+    
+    @objc private func removeButtonPressed() {
+        self.removeAction?()
+    }
+    
+    private var isWobbling = false
+    
+    func setWobbling(_ isWobbling: Bool) {
+        if self.isWobbling == isWobbling {
+            return
+        }
+        self.isWobbling = isWobbling
+        if isWobbling {
+            let angle: CGFloat = 0.004
+            let rotation = CAKeyframeAnimation(keyPath: "transform.rotation.z")
+            rotation.values = [-angle, angle, -angle] as [NSNumber]
+            rotation.duration = 0.34 + Double.random(in: 0.0 ..< 0.06)
+            rotation.beginTime = CACurrentMediaTime() + Double.random(in: 0.0 ..< 0.2)
+            rotation.repeatCount = .infinity
+            rotation.isAdditive = true
+            self.layer.add(rotation, forKey: "wobbleRotation")
+            
+            let bounce = CAKeyframeAnimation(keyPath: "transform.translation.y")
+            bounce.values = [-0.3, 0.3, -0.3] as [NSNumber]
+            bounce.duration = 0.38 + Double.random(in: 0.0 ..< 0.06)
+            bounce.beginTime = CACurrentMediaTime() + Double.random(in: 0.0 ..< 0.2)
+            bounce.repeatCount = .infinity
+            bounce.isAdditive = true
+            self.layer.add(bounce, forKey: "wobbleBounce")
+        } else {
+            self.layer.removeAnimation(forKey: "wobbleRotation")
+            self.layer.removeAnimation(forKey: "wobbleBounce")
+        }
+    }
+    
+    // Only the remove button takes touches, so a tap elsewhere on the row reaches the panel
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let result = super.hitTest(point, with: event)
+        return result === self.removeButton ? result : nil
+    }
+    
+    func setThumbnail(_ image: UIImage?) {
+        self.thumbnailView.image = image
+    }
+    
+    func update(author: String, text: String, accentColor: UIColor, textColor: UIColor, removeIconColor: UIColor, canRemove: Bool, removeButtonWidth: CGFloat, lineX: CGFloat, textX: CGFloat, rowHeight: CGFloat, thumbnailSide: CGFloat?) {
+        var textX = textX
+        if let thumbnailSide {
+            self.thumbnailView.isHidden = false
+            self.thumbnailView.frame = CGRect(x: textX, y: floor((rowHeight - 3.0 - thumbnailSide) * 0.5), width: thumbnailSide, height: thumbnailSide)
+            textX += thumbnailSide + 8.0
+        } else {
+            self.thumbnailView.isHidden = true
+        }
+        self.removeButton.isHidden = !canRemove
+        self.removeButton.frame = CGRect(x: self.bounds.width - removeButtonWidth, y: 0.0, width: removeButtonWidth, height: rowHeight)
+        self.removeIconView.tintColor = removeIconColor
+        if let image = self.removeIconView.image {
+            self.removeIconView.frame = image.size.centered(in: self.removeButton.bounds)
+        }
+        let width = self.bounds.width - removeButtonWidth
+        self.lineView.backgroundColor = accentColor
+        self.lineView.frame = CGRect(x: lineX, y: 2.0, width: 2.0, height: rowHeight - 6.0)
+        self.authorLabel.textColor = accentColor
+        self.authorLabel.text = author
+        self.authorLabel.frame = CGRect(x: textX, y: 0.0, width: max(0.0, width - textX - 8.0), height: 19.0)
+        self.textLabel.textColor = textColor
+        self.textLabel.text = text
+        self.textLabel.frame = CGRect(x: textX, y: 19.0, width: max(0.0, width - textX - 8.0), height: 18.0)
+    }
+}
+
+private struct DeckPanelThumbnail {
+    let mediaId: EngineMedia.Id
+    let dimensions: CGSize
+    let signal: Signal<(TransformImageArguments) -> DrawingContext?, NoError>
+    // A photo's file once it is on disk: drawn straight from it, which does not wait for the preview cache
+    let localData: Signal<Data, NoError>?
+}
+
+// The preview a card in the list shows, as a regular reply does: a photo, or a video's frame
+private func deckPanelThumbnail(context: AccountContext, message: EngineMessage) -> DeckPanelThumbnail? {
+    let rawMessage = message._asMessage()
+    if rawMessage.containsSecretMedia {
+        return nil
+    }
+    let hasSpoiler = message.attributes.contains(where: { $0 is MediaSpoilerMessageAttribute })
+    for media in message.media {
+        if let image = media as? TelegramMediaImage, let imageId = image.id, let representation = largestRepresentationForPhoto(image) {
+            return DeckPanelThumbnail(mediaId: imageId, dimensions: representation.dimensions.cgSize, signal: chatMessagePhotoThumbnail(account: context.account, userLocation: .peer(message.id.peerId), photoReference: .message(message: MessageReference(rawMessage), media: image), blurred: hasSpoiler), localData: hasSpoiler ? nil : deckPanelLocalData(context: context, resource: representation.resource))
+        } else if let file = media as? TelegramMediaFile, file.isVideo, !file.isVideoSticker, !file.isInstantVideo, let fileId = file.id, let dimensions = file.dimensions {
+            return DeckPanelThumbnail(mediaId: fileId, dimensions: dimensions.cgSize, signal: chatMessageVideoThumbnail(account: context.account, userLocation: .peer(message.id.peerId), fileReference: .message(message: MessageReference(rawMessage), media: file), blurred: hasSpoiler), localData: nil)
+        }
+    }
+    return nil
+}
+
+private func deckPanelLocalData(context: AccountContext, resource: TelegramMediaResource) -> Signal<Data, NoError> {
+    return context.account.postbox.mediaBox.resourceData(resource, option: .complete(waitUntilFetchStatus: false), attemptSynchronously: true)
+    |> filter { $0.complete }
+    |> take(1)
+    |> mapToSignal { data -> Signal<Data, NoError> in
+        if let loaded = try? Data(contentsOf: URL(fileURLWithPath: data.path), options: .mappedIfSafe) {
+            return .single(loaded)
+        }
+        return .complete()
+    }
+}
+
+// Recognizes the moment a touch lands outside the panel and takes that touch for itself, so whatever lies under it
+// (a message, a button, the input field) does not react; a touch inside the panel fails it at once and goes on as usual
+private final class DeckDismissGestureRecognizer: UIGestureRecognizer, UIGestureRecognizerDelegate {
+    weak var panelView: UIView?
+    var dismiss: (() -> Void)?
+    
+    init() {
+        super.init(target: nil, action: nil)
+        self.delegate = self
+        self.cancelsTouchesInView = true
+        self.delaysTouchesEnded = false
+    }
+    
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        super.touchesBegan(touches, with: event)
+        guard let panelView = self.panelView, let touch = touches.first else {
+            self.state = .failed
+            return
+        }
+        if panelView.bounds.contains(touch.location(in: panelView)) {
+            self.state = .failed
+        } else {
+            self.state = .recognized
+            DispatchQueue.main.async { [weak self] in
+                self?.dismiss?()
+            }
+        }
+    }
+    
+    // Every other recognizer under the touch waits for this one, so the closing tap is not also a tap on the chat
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer) -> Bool {
+        return true
     }
 }

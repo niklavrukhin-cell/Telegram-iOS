@@ -3027,6 +3027,24 @@ public class ChatMessageBubbleItemNode: ChatMessageItemView, ChatMessagePreviewI
                 } else {
                     headerSize.height += 2.0
                 }
+                if let deck = MultiReplyStore.shared.deck(parentStableId: item.message.stableId) {
+                    let missingMessageIds = deck.messageIds.dropFirst().filter { MultiReplyStore.shared.cachedMessage(id: $0) == nil }
+                    if !missingMessageIds.isEmpty {
+                        let _ = (item.context.engine.data.get(EngineDataList(missingMessageIds.map { TelegramEngine.EngineData.Item.Messages.Message(id: $0) }))
+                        |> deliverOnMainQueue).startStandalone(next: { messages in
+                            var hasCachedMessages = false
+                            for message in messages {
+                                if let message {
+                                    MultiReplyStore.shared.cacheMessage(message._asMessage())
+                                    hasCachedMessages = true
+                                }
+                            }
+                            if hasCachedMessages {
+                                item.controllerInteraction.requestMessageUpdate(item.message.id, false, nil)
+                            }
+                        })
+                    }
+                }
                 let sizeAndApply = replyInfoLayout(ChatMessageReplyInfoNode.Arguments(
                     presentationData: item.presentationData,
                     strings: item.presentationData.strings,
@@ -5948,6 +5966,31 @@ public class ChatMessageBubbleItemNode: ChatMessageItemView, ChatMessagePreviewI
                     }
                 } else if let replyInfoNode = self.replyInfoNode, self.item?.controllerInteraction.tapMessage == nil, replyInfoNode.frame.contains(location) {
                     if let item = self.item {
+                        if let deck = MultiReplyStore.shared.deck(parentStableId: item.message.stableId) {
+                            let localPoint = CGPoint(x: location.x - replyInfoNode.frame.minX, y: location.y - replyInfoNode.frame.minY)
+                            let stableId = item.message.stableId
+                            if let deckCounterFrame = replyInfoNode.deckCounterFrame, deckCounterFrame.insetBy(dx: -12.0, dy: -10.0).contains(localPoint) {
+                                return .action(InternalBubbleTapAction.Action({
+                                    if deck.isExpanded {
+                                        MultiReplyStore.shared.setExpanded(parentStableId: stableId, isExpanded: false)
+                                    } else {
+                                        MultiReplyStore.shared.advance(parentStableId: stableId)
+                                    }
+                                    item.controllerInteraction.requestMessageUpdate(item.message.id, false, nil)
+                                }))
+                            }
+                            if deck.isExpanded {
+                                let targetMessageId = replyInfoNode.deckCardTargets.first(where: { $0.frame.contains(localPoint) })?.messageId ?? deck.messageIds[0]
+                                return .action(InternalBubbleTapAction.Action({
+                                    item.controllerInteraction.navigateToMessage(item.message.id, targetMessageId, NavigateToMessageParams(timestamp: nil, quote: nil))
+                                }, contextMenuOnLongPress: true))
+                            }
+                            return .action(InternalBubbleTapAction.Action({
+                                MultiReplyStore.shared.setExpanded(parentStableId: stableId, isExpanded: true)
+                                item.controllerInteraction.requestMessageUpdate(item.message.id, false, nil)
+                            }, contextMenuOnLongPress: true))
+                        }
+                        
                         if item.controllerInteraction.summarizedMessageIds.contains(item.message.id) {
                             return .action(InternalBubbleTapAction.Action({ [weak self] in
                                 guard let self else {
